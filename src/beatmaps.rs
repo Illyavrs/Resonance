@@ -293,33 +293,59 @@ async fn search(
     RawQuery(raw): RawQuery,
 ) -> Result<Json<Value>, ApiError> {
     let player = common::bearer(&state, &headers).await?;
-    let query = search_query(raw)?;
-    let result = if query.get("source").map(String::as_str) == Some("local") {
-        local_search(&state, &query).await
-    } else {
-        let pairs = query
-            .iter()
-            .filter(|(name, _)| name.as_str() != "source")
-            .collect::<Vec<_>>();
-        let encoded = serde_urlencoded::to_string(pairs)
-            .map_err(|_| ApiError(StatusCode::BAD_REQUEST, "invalid_search_query"))?;
-        match tokio::time::timeout(
-            std::time::Duration::from_secs(8),
-            official_search(&state, player.id, &encoded),
-        )
-        .await
-        {
-            Ok(result) => result,
-            Err(_) => Err(ApiError(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "official_search_unavailable",
-            )),
+    let (source, encoded) = search_route(search_query(raw)?)?;
+    let result = match tokio::time::timeout(std::time::Duration::from_secs(8), async {
+        match source {
+            SearchSource::Official => official_search(&state, player.id, &encoded).await,
+            SearchSource::Server => server_search(&state, player.id, &encoded).await,
         }
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => Err(ApiError(
+            StatusCode::SERVICE_UNAVAILABLE,
+            match source {
+                SearchSource::Official => "official_search_unavailable",
+                SearchSource::Server => "server_search_unavailable",
+            },
+        )),
     };
-    // A token revoked while waiting cannot consume a cached official response
-    // or disclose an upstream failure in place of its authentication failure.
+    // A token revoked while waiting cannot consume catalogue metadata or
+    // disclose a backend failure in place of its authentication failure.
     common::bearer(&state, &headers).await?;
     Ok(Json(result?))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SearchSource {
+    Official,
+    Server,
+}
+
+fn search_route(mut query: HashMap<String, String>) -> Result<(SearchSource, String), ApiError> {
+    let source = query.remove("source");
+    let reserved_query = query
+        .get("q")
+        .and_then(|q| q.trim().strip_prefix("server:"))
+        .map(|q| q.trim().to_owned());
+    let server =
+        source.as_deref() == Some("local") || (source.is_none() && reserved_query.is_some());
+    if server && let Some(q) = reserved_query {
+        query.insert("q".into(), q);
+    }
+    // Explicit official selection escapes the reserved server query syntax.
+    // The shared backend owns all filter and opaque cursor interpretation.
+    let encoded = serde_urlencoded::to_string(query)
+        .map_err(|_| ApiError(StatusCode::BAD_REQUEST, "invalid_search_query"))?;
+    Ok((
+        if server {
+            SearchSource::Server
+        } else {
+            SearchSource::Official
+        },
+        encoded,
+    ))
 }
 
 fn search_query(raw: Option<String>) -> Result<HashMap<String, String>, ApiError> {
@@ -480,65 +506,180 @@ fn validate_official_search(value: &Value) -> Result<(), ApiError> {
     Ok(())
 }
 
-async fn local_search(
-    state: &AppState,
-    query: &HashMap<String, String>,
-) -> Result<Value, ApiError> {
-    if query
-        .keys()
-        .any(|name| !matches!(name.as_str(), "source" | "q" | "m" | "s" | "cursor_string"))
-    {
+async fn server_search(state: &AppState, user_id: i64, query: &str) -> Result<Value, ApiError> {
+    if state.service_key.len() < 32 {
         return Err(ApiError(
-            StatusCode::BAD_REQUEST,
-            "unsupported_local_search_filter",
+            StatusCode::SERVICE_UNAVAILABLE,
+            "server_search_not_configured",
         ));
     }
-    let q = query.get("q").cloned().unwrap_or_default();
-    if q.len() > 800 || q.chars().count() > 200 || q.chars().any(char::is_control) {
-        return Err(ApiError(StatusCode::BAD_REQUEST, "invalid_search_query"));
+    let mut response = state
+        .http
+        .post(format!(
+            "{}/api/v1/internal/beatmapsets/catalogue-search",
+            state.sanctuary_url.trim_end_matches('/')
+        ))
+        .header("x-illya-service-key", state.service_key.as_str())
+        .json(&json!({"user_id":user_id,"query":query}))
+        .send()
+        .await
+        .map_err(|_| ApiError(StatusCode::SERVICE_UNAVAILABLE, "server_search_unavailable"))?;
+    if response.status() != StatusCode::OK {
+        return Err(match response.status() {
+            StatusCode::BAD_REQUEST => ApiError(
+                StatusCode::BAD_REQUEST,
+                "unsupported_or_invalid_search_filter",
+            ),
+            StatusCode::UNAUTHORIZED => ApiError(StatusCode::UNAUTHORIZED, "invalid_account"),
+            StatusCode::CONFLICT => ApiError(StatusCode::CONFLICT, "server_catalogue_changed"),
+            StatusCode::TOO_MANY_REQUESTS => {
+                ApiError(StatusCode::TOO_MANY_REQUESTS, "server_search_rate_limited")
+            }
+            StatusCode::SERVICE_UNAVAILABLE => {
+                ApiError(StatusCode::SERVICE_UNAVAILABLE, "server_search_unavailable")
+            }
+            _ => ApiError(StatusCode::BAD_GATEWAY, "server_search_failed"),
+        });
     }
-    let mode = query
-        .get("m")
-        .map(|value| {
-            value
-                .parse::<i16>()
-                .ok()
-                .filter(|mode| (-1..=3).contains(mode))
-                .ok_or(ApiError(StatusCode::BAD_REQUEST, "invalid_mode"))
-        })
-        .transpose()?
-        .filter(|mode| *mode >= 0);
-    let status = match query.get("s").map(String::as_str) {
-        None | Some("any") => None,
-        Some(status @ ("ranked" | "loved" | "pending" | "unranked" | "graveyard" | "wip")) => {
-            Some(status)
+    const LIMIT: usize = 4 * 1024 * 1024;
+    let invalid = || ApiError(StatusCode::BAD_GATEWAY, "invalid_server_search_response");
+    if response
+        .content_length()
+        .is_some_and(|length| length > LIMIT as u64)
+    {
+        return Err(invalid());
+    }
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|_| invalid())? {
+        if chunk.len() > LIMIT - bytes.len() {
+            return Err(invalid());
         }
-        Some(_) => return Err(ApiError(StatusCode::BAD_REQUEST, "invalid_search_status")),
-    };
-    let offset: i64 = query
-        .get("cursor_string")
-        .map(|value| {
-            value
-                .parse()
-                .map_err(|_| ApiError(StatusCode::BAD_REQUEST, "invalid_search_cursor"))
-        })
-        .transpose()?
-        .unwrap_or(0);
-    if !(0..=1_000_000).contains(&offset) {
-        return Err(ApiError(StatusCode::BAD_REQUEST, "invalid_search_cursor"));
+        bytes.extend_from_slice(&chunk);
     }
-    // Search the canonical set membership, including every package difficulty.
-    let total:i64=sqlx::query_scalar("SELECT count(DISTINCT b.native_set_id) FROM active_beatmaps b WHERE concat_ws(' ',b.title,b.artist,b.creator,b.version) ILIKE '%'||$1||'%' AND ($2::smallint IS NULL OR b.mode=$2) AND ($3::text IS NULL OR b.status=$3)").bind(&q).bind(mode).bind(status).fetch_one(&state.pool).await?;
-    let ids=sqlx::query_scalar::<_,i64>("SELECT DISTINCT b.native_set_id FROM active_beatmaps b WHERE concat_ws(' ',b.title,b.artist,b.creator,b.version) ILIKE '%'||$1||'%' AND ($2::smallint IS NULL OR b.mode=$2) AND ($3::text IS NULL OR b.status=$3) ORDER BY 1 DESC LIMIT 50 OFFSET $4").bind(q).bind(mode).bind(status).bind(offset).fetch_all(&state.pool).await?;
-    let mut sets = Vec::new();
-    for id in ids {
-        sets.push(local_set_json(state, id).await?);
+    let value: Value = serde_json::from_slice(&bytes).map_err(|_| invalid())?;
+    validate_server_search(&value)?;
+    let sets = value["beatmapsets"].as_array().unwrap();
+    let map_ids = sets
+        .iter()
+        .flat_map(|set| set["beatmaps"].as_array().unwrap())
+        .map(|map| map["id"].as_i64().unwrap())
+        .collect::<Vec<_>>();
+    let set_ids = sets
+        .iter()
+        .flat_map(|set| set["beatmaps"].as_array().unwrap())
+        .map(|map| map["beatmapset_id"].as_i64().unwrap())
+        .collect::<Vec<_>>();
+    // A server page owns its total and continuation. Recheck its epoch and
+    // returned authority in one snapshot after the backend wait, including
+    // empty pages whose membership may have changed during that wait.
+    let rows = sqlx::query("SELECT revision.epoch, candidate.native_id, candidate.native_set_id, CASE WHEN candidate.native_set_id IS NULL THEN true ELSE illya_beatmapset_active(candidate.native_set_id) END AS active, COALESCE(o.status,b.status) AS status FROM server_catalogue_revision revision LEFT JOIN LATERAL unnest($1::bigint[],$2::bigint[]) AS candidate(native_id,native_set_id) ON true LEFT JOIN beatmap_status_overrides o ON o.native_id=candidate.native_id AND o.native_set_id=candidate.native_set_id LEFT JOIN beatmaps b ON b.native_id=candidate.native_id AND b.native_set_id=candidate.native_set_id WHERE revision.singleton")
+        .bind(map_ids).bind(set_ids).fetch_all(&state.pool).await?;
+    if rows.is_empty() {
+        return Err(invalid());
     }
-    Ok(
-        json!({"beatmapsets":sets,"total":total,"cursor":null,"cursor_string":if offset+50<total{Some((offset+50).to_string())}else{None},"error":null}),
-    )
+    for row in rows {
+        let changed = || ApiError(StatusCode::CONFLICT, "server_catalogue_changed");
+        if value["catalogue_revision"].as_i64() != Some(row.get::<i64, _>("epoch"))
+            || !row.get::<bool, _>("active")
+        {
+            return Err(changed());
+        }
+        if let Some(status) = row.get::<Option<String>, _>("status") {
+            let wire_status = if status == "unranked" {
+                "pending"
+            } else {
+                &status
+            };
+            let map_id = row.get::<i64, _>("native_id");
+            let set_id = row.get::<i64, _>("native_set_id");
+            let map = sets
+                .iter()
+                .find(|set| set["id"].as_i64() == Some(set_id))
+                .unwrap()["beatmaps"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|map| map["id"].as_i64() == Some(map_id))
+                .unwrap();
+            if map["status"].as_str() != Some(wire_status) {
+                return Err(changed());
+            }
+        }
+    }
+    Ok(value)
 }
 
+fn validate_server_search(value: &Value) -> Result<(), ApiError> {
+    let invalid = || ApiError(StatusCode::BAD_GATEWAY, "invalid_server_search_response");
+    let sets = value["beatmapsets"]
+        .as_array()
+        .filter(|sets| sets.len() <= 50)
+        .ok_or_else(invalid)?;
+    value["total"]
+        .as_i64()
+        .filter(|total| (sets.len() as i64..=i32::MAX as i64).contains(total))
+        .ok_or_else(invalid)?;
+    value["catalogue_revision"]
+        .as_i64()
+        .filter(|revision| *revision >= 0)
+        .ok_or_else(invalid)?;
+    match (value.get("cursor"), value.get("cursor_string")) {
+        (Some(Value::Null), Some(Value::Null)) => {}
+        (Some(Value::Object(cursor)), Some(Value::String(token)))
+            if cursor.len() == 1
+                && !token.is_empty()
+                && token.len() <= 2048
+                && token.is_ascii()
+                && cursor.get("illya").and_then(Value::as_str) == Some(token.as_str()) => {}
+        _ => return Err(invalid()),
+    }
+    let valid_status = |item: &Value| {
+        let status = item["status"].as_str().unwrap_or_default();
+        status != "unranked"
+            && native_rank(status)
+                .is_ok_and(|rank| item["ranked"].as_i64() == Some(i64::from(rank)))
+    };
+    let mut set_ids = std::collections::HashSet::new();
+    let mut map_ids = std::collections::HashSet::new();
+    for set in sets {
+        let id = set["id"]
+            .as_i64()
+            .filter(|id| crate::native_maps::valid_id(*id))
+            .ok_or_else(invalid)?;
+        let disabled = set["availability"]["download_disabled"]
+            .as_bool()
+            .ok_or_else(invalid)?;
+        let metadata_only = set["metadata_only"].as_bool().ok_or_else(invalid)?;
+        if !set_ids.insert(id)
+            || !valid_status(set)
+            || set["download_disabled"].as_bool() != Some(disabled)
+            || (metadata_only && !disabled)
+        {
+            return Err(invalid());
+        }
+        let maps = set["beatmaps"]
+            .as_array()
+            .filter(|maps| !maps.is_empty() && maps.len() <= 512)
+            .ok_or_else(invalid)?;
+        for map in maps {
+            let map_id = map["id"]
+                .as_i64()
+                .filter(|id| crate::native_maps::valid_id(*id))
+                .ok_or_else(invalid)?;
+            if !map_ids.insert(map_id)
+                || map["beatmapset_id"].as_i64() != Some(id)
+                || !valid_status(map)
+            {
+                return Err(invalid());
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+#[path = "effective_catalogue_tests.rs"]
+mod effective_catalogue_tests;
 #[cfg(test)]
 #[path = "lazer_search_tests.rs"]
 mod search_tests;

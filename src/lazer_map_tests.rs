@@ -55,6 +55,8 @@ struct Backend {
     invalid: Arc<AtomicU8>,
     mode: Arc<AtomicI16>,
     calls: Arc<Mutex<Vec<Value>>>,
+    catalogue_calls: Arc<Mutex<Vec<Value>>>,
+    catalogue_state: Arc<Mutex<Option<common::AppState>>>,
     ingested: Arc<Mutex<Vec<Value>>>,
     pause: Arc<AtomicBool>,
     entered: Arc<Notify>,
@@ -196,6 +198,51 @@ async fn missing_set_metadata(
     )
 }
 
+// This fixture models the shared service boundary for retained canonical sets.
+// Complete catalogue filtering/cursors have their own original fixtures.
+async fn catalogue_search(
+    State(backend): State<Backend>,
+    headers: HeaderMap,
+    Json(input): Json<Value>,
+) -> (StatusCode, Json<Value>) {
+    assert_eq!(headers["x-illya-service-key"], SERVICE_KEY);
+    assert!(headers.get("authorization").is_none());
+    assert_eq!(input.as_object().unwrap().len(), 2);
+    assert!(input["user_id"].as_i64().unwrap() > 0);
+    let query: std::collections::HashMap<String, String> =
+        serde_urlencoded::from_str(input["query"].as_str().unwrap()).unwrap();
+    assert!(query.keys().all(|key| key == "q"));
+    backend.catalogue_calls.lock().await.push(input);
+    let state = backend
+        .catalogue_state
+        .lock()
+        .await
+        .as_ref()
+        .unwrap()
+        .clone();
+    let query = query.get("q").map(String::as_str).unwrap_or_default();
+    let ids = sqlx::query_scalar::<_, i64>("SELECT DISTINCT native_set_id FROM active_beatmaps WHERE concat_ws(' ',title,artist,creator,version) ILIKE '%'||$1||'%' ORDER BY native_set_id DESC")
+        .bind(query).fetch_all(&state.pool).await.unwrap();
+    let mut sets = Vec::new();
+    for id in ids {
+        let mut set = beatmaps::local_set_json(&state, id).await.unwrap();
+        set["metadata_only"] = json!(false);
+        sets.push(set);
+    }
+    let revision =
+        sqlx::query_scalar::<_, i64>("SELECT epoch FROM server_catalogue_revision WHERE singleton")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+    (
+        StatusCode::OK,
+        Json(json!({
+            "total":sets.len(),"beatmapsets":sets,"catalogue_revision":revision,
+            "cursor":null,"cursor_string":null
+        })),
+    )
+}
+
 struct Fixture {
     control: PgPool,
     state: common::AppState,
@@ -267,6 +314,8 @@ impl Fixture {
             invalid: Arc::new(AtomicU8::new(0)),
             mode: Arc::new(AtomicI16::new(0)),
             calls: Default::default(),
+            catalogue_calls: Default::default(),
+            catalogue_state: Default::default(),
             ingested: Default::default(),
             pause: Default::default(),
             entered: Default::default(),
@@ -279,6 +328,10 @@ impl Fixture {
             .route(
                 "/api/v1/internal/beatmapsets/metadata",
                 post(missing_set_metadata),
+            )
+            .route(
+                "/api/v1/internal/beatmapsets/catalogue-search",
+                post(catalogue_search),
             )
             .route("/api/v1/internal/scores", post(ingest))
             .with_state(backend.clone());
@@ -299,6 +352,7 @@ impl Fixture {
             signalr: Arc::new(crate::signalr::Runtime::new()),
             lazer_chat: Arc::new(crate::lazer_chat::Runtime::new()),
         };
+        *backend.catalogue_state.lock().await = Some(state.clone());
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         let router = lazer::router()
@@ -1053,6 +1107,7 @@ fixture_test!(
                 .all(|set| set["beatmaps"][0]["version"] == "Imported")
         );
         assert!(f.backend.calls.lock().await.is_empty());
+        assert_eq!(f.backend.catalogue_calls.lock().await.len(), 2);
         let direct = body(
             f.get(&format!("/api/v2/beatmaps/{collision}")).await,
             StatusCode::OK,
@@ -1428,6 +1483,7 @@ fixture_test!(
         assert_eq!(search["total"], 1);
         assert_eq!(search["beatmapsets"].as_array().unwrap().len(), 1);
         assert_eq!(search["beatmapsets"][0]["id"], set);
+        assert_eq!(f.backend.catalogue_calls.lock().await.len(), 1);
         let archive = f.get(&format!("/api/v2/beatmapsets/{set}/download")).await;
         assert_eq!(archive.status(), StatusCode::OK);
         assert_eq!(
@@ -1619,6 +1675,7 @@ fixture_test!(
             .await["total"],
             0
         );
+        assert_eq!(f.backend.catalogue_calls.lock().await.len(), 1);
         assert!(
             body(
                 f.get(&format!("/api/v2/users/{user}/scores/best")).await,

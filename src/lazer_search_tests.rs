@@ -14,8 +14,8 @@ use tokio::{
 };
 use tower::ServiceExt;
 
-const ACCESS: &str = "original-native-search-access";
-const KEY: &str = "original-native-search-service-key-32-bytes";
+pub(super) const ACCESS: &str = "original-native-search-access";
+pub(super) const KEY: &str = "original-native-search-service-key-32-bytes";
 
 fn result() -> Value {
     json!({"beatmapsets":[{"id":820001,"title":"搜尋 Fixture","beatmaps":[{"id":720001,"beatmapset_id":820001,"version":"Hard","mode_int":0,"difficulty_rating":4.2}]}],"total":51,"cursor":{"approved_date":"2026-01-01T00:00:00+00:00","id":820001},"cursor_string":"opaque-future-cursor"})
@@ -92,12 +92,14 @@ fn native_search_rejects_invalid_internal_identity_and_cursor_shape() {
 }
 
 #[derive(Clone)]
-struct Backend {
-    reply: Arc<Mutex<(StatusCode, Vec<u8>)>>,
-    calls: Arc<Mutex<Vec<Value>>>,
-    pause: Arc<std::sync::atomic::AtomicBool>,
-    entered: Arc<Notify>,
-    release: Arc<Notify>,
+pub(super) struct Backend {
+    pub(super) reply: Arc<Mutex<(StatusCode, Vec<u8>)>>,
+    pub(super) calls: Arc<Mutex<Vec<Value>>>,
+    pub(super) server_reply: Arc<Mutex<(StatusCode, Vec<u8>)>>,
+    pub(super) server_calls: Arc<Mutex<Vec<Value>>>,
+    pub(super) pause: Arc<std::sync::atomic::AtomicBool>,
+    pub(super) entered: Arc<Notify>,
+    pub(super) release: Arc<Notify>,
 }
 
 async fn search_backend(
@@ -120,19 +122,19 @@ async fn search_backend(
     (status, bytes).into_response()
 }
 
-struct Fixture {
+pub(super) struct Fixture {
     control: PgPool,
-    state: AppState,
+    pub(super) state: AppState,
     app: Router,
     schema: String,
     storage: std::path::PathBuf,
-    backend: Backend,
+    pub(super) backend: Backend,
     task: JoinHandle<()>,
-    user: i64,
+    pub(super) user: i64,
 }
 
 impl Fixture {
-    async fn new() -> Self {
+    pub(super) async fn new() -> Self {
         let url = std::env::var("ILLYA_TEST_DATABASE_URL")
             .expect("owned disposable PostgreSQL URL required");
         let parsed = reqwest::Url::parse(&url).unwrap();
@@ -168,6 +170,13 @@ impl Fixture {
                 result().to_string().into_bytes(),
             ))),
             calls: Default::default(),
+            server_reply: Arc::new(Mutex::new((
+                StatusCode::OK,
+                json!({"beatmapsets":[],"total":0,"catalogue_revision":0,"cursor":null,"cursor_string":null})
+                    .to_string()
+                    .into_bytes(),
+            ))),
+            server_calls: Default::default(),
             pause: Default::default(),
             entered: Default::default(),
             release: Default::default(),
@@ -176,6 +185,10 @@ impl Fixture {
         let origin = format!("http://{}", listener.local_addr().unwrap());
         let app = Router::new()
             .route("/api/v1/internal/beatmapsets/search", post(search_backend))
+            .route(
+                "/api/v1/internal/beatmapsets/catalogue-search",
+                post(super::effective_catalogue_tests::catalogue_backend),
+            )
             .with_state(backend.clone());
         let task = tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
@@ -209,7 +222,7 @@ impl Fixture {
             user,
         }
     }
-    async fn get(&self, query: &str, authenticated: bool) -> (StatusCode, Value) {
+    pub(super) async fn get(&self, query: &str, authenticated: bool) -> (StatusCode, Value) {
         let mut request = Request::builder().uri(format!("/api/v2/beatmapsets/search?{query}"));
         if authenticated {
             request = request.header("authorization", format!("Bearer {ACCESS}"));
@@ -226,7 +239,7 @@ impl Fixture {
             .unwrap();
         (status, serde_json::from_slice(&bytes).unwrap())
     }
-    async fn cleanup(self) {
+    pub(super) async fn cleanup(self) {
         self.task.abort();
         self.state.pool.close().await;
         sqlx::query(&format!("DROP SCHEMA {} CASCADE", self.schema))
@@ -303,15 +316,16 @@ async fn native_official_search_failures_never_fall_back_to_local_catalogue() {
             f.get("source=local", true).await,
             (
                 StatusCode::OK,
-                json!({"beatmapsets":[],"total":0,"cursor":null,"cursor_string":null,"error":null})
+                json!({"beatmapsets":[],"total":0,"catalogue_revision":0,"cursor":null,"cursor_string":null})
             )
         );
         assert_eq!(f.backend.calls.lock().await.len(), before);
+        assert_eq!(f.backend.server_calls.lock().await.len(), 1);
+        *f.backend.server_reply.lock().await = (StatusCode::BAD_REQUEST, Vec::new());
         for query in [
             "source=local&m=banana",
             "source=local&s=invalid",
             "source=local&cursor_string=opaque",
-            "source=local&sort=ranked_desc",
         ] {
             assert_eq!(
                 f.get(query, true).await.0,
@@ -319,6 +333,12 @@ async fn native_official_search_failures_never_fall_back_to_local_catalogue() {
                 "{query}"
             );
         }
+        *f.backend.server_reply.lock().await = (
+            StatusCode::OK,
+            json!({"beatmapsets":[],"total":0,"catalogue_revision":0,"cursor":null,"cursor_string":null})
+                .to_string().into_bytes(),
+        );
+        assert_eq!(f.get("source=local&sort=ranked_desc", true).await.0, StatusCode::OK);
     })
     .catch_unwind()
     .await;
@@ -422,6 +442,14 @@ async fn native_local_graveyard_and_wip_resolve_with_negative_wire_ranks() {
             assert_eq!(value["status"], status);
             assert_eq!(value["ranked"], rank);
             assert_eq!(value["beatmapset"]["status"], status);
+            let set = local_set_json(&f.state, value["beatmapset"]["id"].as_i64().unwrap()).await.unwrap();
+            let mut set = set;
+            set["metadata_only"] = json!(false);
+            let disabled = set["availability"]["download_disabled"].clone();
+            set["download_disabled"] = disabled;
+            let page = super::effective_catalogue_tests::with_revision(&f,
+                json!({"beatmapsets":[set],"total":1,"cursor":null,"cursor_string":null})).await;
+            *f.backend.server_reply.lock().await = (StatusCode::OK, page.to_string().into_bytes());
             let (search_status, page) = f.get(&format!("source=local&s={status}"), true).await;
             assert_eq!(search_status, StatusCode::OK);
             assert_eq!(page["total"], 1);
@@ -438,6 +466,7 @@ async fn native_local_graveyard_and_wip_resolve_with_negative_wire_ranks() {
             assert!(text.starts_with(&format!("0|false|{}|{}|", value["id"].as_i64().unwrap(), value["beatmapset"]["id"].as_i64().unwrap())));
         }
         assert!(f.backend.calls.lock().await.is_empty());
+        assert_eq!(f.backend.server_calls.lock().await.len(), 2);
     }).catch_unwind().await;
     f.cleanup().await;
     if let Err(error) = check {
