@@ -26,6 +26,8 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, broadcast};
 
 const MAX_CHANNELS: i64 = 4096;
 const MAX_WIRE: usize = 65_536;
+const RECONNECT_PER_CHANNEL: i64 = 50;
+const RECONNECT_TOTAL: i64 = 200;
 
 pub struct Runtime {
     endpoint: String,
@@ -851,6 +853,87 @@ async fn deliver(state: &AppState, user: &Account, id: i64) -> Result<Option<Val
         json!({"messages":[message_json(&row)],"users":[crate::lazer::user_json(&sender)]}),
     ))
 }
+async fn reconnect_ids(
+    state: &AppState,
+    user: i64,
+    channels: &[i64],
+) -> Result<Vec<i64>, ApiError> {
+    // The client sends no cursor on chat.start. Recover a recent window, bounded
+    // per channel and across the socket, without scanning an unlimited archive.
+    let ids = sqlx::query_scalar::<_, i64>(
+        "SELECT recent.id FROM unnest($1::bigint[]) AS joined(channel_id) CROSS JOIN LATERAL (
+            SELECT m.id,m.user_id,m.channel_id FROM chat_messages m
+            WHERE m.channel_id=joined.channel_id
+            ORDER BY m.id DESC LIMIT $3
+        ) recent JOIN users u ON u.id=recent.user_id
+        WHERE NOT u.is_restricted
+        AND EXISTS(SELECT 1 FROM lazer_channel_members WHERE user_id=$2 AND channel_id=recent.channel_id)
+        AND NOT EXISTS(SELECT 1 FROM user_relationships r WHERE r.relation_type='block'
+            AND ((r.user_id=$2 AND r.target_id=recent.user_id) OR (r.target_id=$2 AND r.user_id=recent.user_id)))
+        ORDER BY recent.id DESC LIMIT $4",
+    )
+    .bind(channels)
+    .bind(user)
+    .bind(RECONNECT_PER_CHANNEL)
+    .bind(RECONNECT_TOTAL)
+    .fetch_all(&state.pool)
+    .await?;
+    Ok(ids.into_iter().rev().collect())
+}
+async fn replay_on_start(
+    socket: &mut WebSocket,
+    state: &AppState,
+    headers: &HeaderMap,
+    known: &mut HashMap<i64, Value>,
+    seen: &mut HashSet<i64>,
+) -> Result<(), ()> {
+    let user = common::bearer(state, headers).await.map_err(|_| ())?;
+    let current = joined(state, &user).await.map_err(|_| ())?;
+    let mut channels: Vec<_> = current.into_keys().collect();
+    channels.sort_unstable();
+    // Join events precede the recovered messages even when REST presence and
+    // socket startup arrive in different orders. Recheck each channel because
+    // membership or permissions may change while a large snapshot is sent.
+    for id in channels {
+        let user = common::bearer(state, headers).await.map_err(|_| ())?;
+        let row = sqlx::query("SELECT c.* FROM channels c JOIN lazer_channel_members m ON m.channel_id=c.id WHERE m.user_id=$1 AND c.id=$2")
+            .bind(user.id).bind(id).fetch_optional(&state.pool).await.map_err(|_| ())?;
+        if let Some(row) = row
+            && allowed(state, &user, &row).await.map_err(|_| ())?
+        {
+            let channel = channel_json(state, &user, &row).await.map_err(|_| ())?;
+            emit(socket, "chat.channel.join", channel.clone()).await?;
+            known.insert(id, channel);
+        }
+    }
+    let channels: Vec<_> = known.keys().copied().collect();
+    let ids = reconnect_ids(state, user.id, &channels)
+        .await
+        .map_err(|_| ())?;
+    for id in ids {
+        let user = common::bearer(state, headers).await.map_err(|_| ())?;
+        let Some(data) = deliver(state, &user, id).await.map_err(|_| ())? else {
+            continue;
+        };
+        // Live PM events may introduce a conversation; recovery only reads
+        // conversations still joined by this user at the time of delivery.
+        let member = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM lazer_channel_members WHERE user_id=$1 AND channel_id=$2)",
+        )
+        .bind(user.id)
+        .bind(data["messages"][0]["channel_id"].as_i64().ok_or(())?)
+        .fetch_one(&state.pool)
+        .await
+        .map_err(|_| ())?;
+        if member {
+            emit(socket, "chat.message.new", data).await?;
+            // Commit notifications queued during the snapshot must not emit the
+            // same persisted message a second time on this socket.
+            seen.insert(id);
+        }
+    }
+    Ok(())
+}
 async fn connection(
     mut socket: WebSocket,
     state: AppState,
@@ -859,6 +942,7 @@ async fn connection(
     _permit: SocketPermit,
 ) {
     let mut active = false;
+    let mut recovered = false;
     let mut known = HashMap::<i64, Value>::new();
     let mut seen = HashSet::<i64>::new();
     let mut interval = tokio::time::interval(Duration::from_secs(1));
@@ -870,7 +954,13 @@ async fn connection(
                 Some(Ok(Message::Text(text)))=>{
                     if command_window.elapsed()>Duration::from_secs(60){command_count=0;command_window=std::time::Instant::now();}command_count+=1;if command_count>60{break;}
                     if common::bearer(&state,&headers).await.is_err(){break;}
-                match command(&text){Ok(enabled)=>{active=enabled;},Err(error)=>{let text=json!({"event":"error","error":error}).to_string();if send(&mut socket,Message::Text(text.into())).await.is_err(){break;}}}
+                match command(&text){Ok(enabled)=>{
+                    active=enabled;
+                    if enabled && !recovered {
+                        if replay_on_start(&mut socket,&state,&headers,&mut known,&mut seen).await.is_err(){break;}
+                        recovered=true;
+                    }
+                },Err(error)=>{let text=json!({"event":"error","error":error}).to_string();if send(&mut socket,Message::Text(text.into())).await.is_err(){break;}}}
             },Some(Ok(Message::Ping(payload)))=>{if send(&mut socket,Message::Pong(payload)).await.is_err(){break;}},Some(Ok(Message::Pong(_)))=>{},_=>break,
             },
             event=events.recv()=>{

@@ -5,6 +5,9 @@ use tokio_tungstenite::{
     tungstenite::{Message as ClientMessage, client::IntoClientRequest},
 };
 
+#[path = "reconnect_tests.rs"]
+mod reconnect;
+
 #[test]
 fn native_commands_have_no_arbitrary_payload_or_unbounded_frames() {
     assert_eq!(
