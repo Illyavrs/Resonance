@@ -1,5 +1,5 @@
 //! Complete official set metadata for native browsing. Difficulty content is
-//! still resolved separately; metadata never implies an archive is available.
+//! still resolved separately; configured acquisition is distinct from retention.
 use crate::{
     beatmaps,
     common::{ApiError, AppState},
@@ -252,9 +252,10 @@ pub(crate) async fn set_json(state: &AppState, user_id: i64, id: i64) -> Result<
     if now_archived {
         return beatmaps::local_set_json(state, id).await;
     }
-    // This metadata-only response does not establish archive membership. An
-    // archive committed after the check can be advertised on the next request.
-    let disabled = true;
+    // Provider capability is projected by Sanctuary from bounded validated
+    // metadata and its fresh policy/configuration. It does not publish rows or
+    // imply a retained archive. Acquisition verifies the full ZIP on demand.
+    let disabled = !metadata.archive_download_available;
     let mut set = json!({
         "id":id,"artist":metadata.artist,"artist_unicode":metadata.artist_unicode,
         "title":metadata.title,"title_unicode":metadata.title_unicode,"creator":metadata.creator,
@@ -263,7 +264,8 @@ pub(crate) async fn set_json(state: &AppState, user_id: i64, id: i64) -> Result<
         "genre":metadata.genre,"language":metadata.language,
         "covers":{"cover":"","cover@2x":"","card":"","card@2x":"","list":"","list@2x":"","slimcover":"","slimcover@2x":""},
         "preview_url":"","video":false,"storyboard":false,"download_disabled":disabled,
-        "availability":{"download_disabled":disabled,"more_information":null},"beatmaps":maps
+        "availability":{"download_disabled":disabled,"more_information":null},
+        "archive_download_available":!disabled,"beatmaps":maps
     });
     if let Some(stored) = stored_set {
         // Retain local display text and moderation. No mapper account mapping

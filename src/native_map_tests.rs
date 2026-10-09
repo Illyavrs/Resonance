@@ -845,21 +845,46 @@ async fn native_maps_discover_from_valid_score_and_keep_local_storage_identity()
             .unwrap();
         assert_ne!(local, OFFICIAL_ID);
         assert_eq!(f.backend.ingested.lock().await[0]["beatmap_id"], local);
-        let verification: String =
-            sqlx::query_scalar("SELECT verification FROM scores WHERE beatmap_id=$1")
+        let saved =
+            sqlx::query("SELECT id,verification,replay_path FROM scores WHERE beatmap_id=$1")
                 .bind(local)
                 .fetch_one(&f.state.pool)
                 .await
                 .unwrap();
-        assert_eq!(verification, "pending");
-        assert!(
-            f.board(HASH)
-                .await
-                .text()
-                .await
-                .unwrap()
-                .starts_with(&format!("2|false|{OFFICIAL_ID}|{SET_ID}|"))
-        );
+        let score_id: i64 = saved.get("id");
+        // A validated passed stable submission is published after its replay
+        // is attached. This is native protocol admission, not gameplay proof.
+        assert_eq!(saved.get::<String, _>("verification"), "verified");
+        assert!(chart.contains(&format!("onlineScoreId:{score_id}|")));
+        let replay_path: String = saved.get("replay_path");
+        let replay_bytes = tokio::fs::read(f.storage.join("replays").join(replay_path))
+            .await
+            .unwrap();
+        let replay = resonance_protocol::replay::LegacyReplay::parse(&replay_bytes).unwrap();
+        assert_eq!(replay.beatmap_md5, HASH);
+        assert_eq!(replay.player_name, USER);
+        assert_eq!(replay.online_score_id, Some(score_id));
+        assert_eq!(replay.compressed_frames, FRAMES);
+        let board = f.board(HASH).await;
+        assert_eq!(board.status(), StatusCode::OK);
+        let board = board.text().await.unwrap();
+        assert!(board.starts_with(&format!("2|false|{OFFICIAL_ID}|{SET_ID}|1|0|")));
+        let public_score = board.lines().nth(5).unwrap();
+        assert!(public_score.starts_with(&format!("{score_id}|{USER}|600|2|")));
+        assert_eq!(public_score.split('|').nth(13), Some("1"));
+        assert_eq!(public_score.split('|').nth(15), Some("1"));
+        let mut replay_query = f.auth();
+        replay_query.extend([("c", score_id.to_string()), ("m", "0".into())]);
+        let downloaded = f
+            .state
+            .http
+            .get(format!("{}/web/osu-getreplay.php", f.base))
+            .query(&replay_query)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(downloaded.status(), StatusCode::OK);
+        assert_eq!(downloaded.bytes().await.unwrap().as_ref(), FRAMES);
         assert_eq!(f.backend.calls.lock().await.len(), 1);
     })
     .catch_unwind()

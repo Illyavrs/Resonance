@@ -906,15 +906,13 @@ pub async fn beatmap_archive(
         .trim_end_matches('n')
         .parse()
         .map_err(|_| ApiError(StatusCode::BAD_REQUEST, "invalid_beatmap_id"))?;
-    let path = crate::native_maps::archive_path(&state, id)
-        .await?
-        .ok_or(ApiError(StatusCode::NOT_FOUND, "archive_not_available"))?;
-    let bytes = common::stored_file(&state, &path, "maps", 104_857_600).await?;
-    crate::native_maps::require_active(&state.pool, id).await?;
+    let bytes = crate::native_archives::bytes(&state, id, None).await?;
     Ok((
         [
             ("content-type", "application/x-osu-beatmap-archive"),
             ("content-disposition", "attachment; filename=beatmap.osz"),
+            ("cache-control", "private, no-store"),
+            ("x-content-type-options", "nosniff"),
         ],
         bytes,
     )
@@ -1056,7 +1054,7 @@ async fn search(
     let mut output = format!("{}\n", sets.len());
     for set in sets {
         output.push_str(
-            &direct_set_line(&state, set)
+            &direct_set_line(&state, set, None)
                 .await?
                 .ok_or(ApiError(StatusCode::NOT_FOUND, "archive_not_available"))?,
         );
@@ -1068,7 +1066,7 @@ async fn search_set(
     State(state): State<AppState>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Result<String, ApiError> {
-    web_auth(&state, &query).await?;
+    let player = web_auth(&state, &query).await?;
     let set = if let Some(raw) = query.get("b") {
         let id = raw
             .parse::<i64>()
@@ -1099,14 +1097,40 @@ async fn search_set(
     } else {
         None
     };
-    match set {
-        Some(set) => Ok(direct_set_line(&state, set).await?.unwrap_or_default()),
+    let result = match set {
+        Some(set) => direct_set_line(&state, set, Some(player.id))
+            .await
+            .map(|line| line.unwrap_or_default()),
         None => Ok(String::new()),
-    }
+    };
+    // Recheck credentials and account restriction after the metadata wait.
+    web_auth(&state, &query).await?;
+    result
 }
-async fn direct_set_line(state: &AppState, id: i64) -> Result<Option<String>, ApiError> {
+async fn direct_set_line(
+    state: &AppState,
+    id: i64,
+    user: Option<i64>,
+) -> Result<Option<String>, ApiError> {
     if crate::native_maps::archive_path(state, id).await?.is_none() {
-        return Ok(None);
+        // Bulk osu!direct search deliberately keeps its existing retained-set
+        // catalogue and does no metadata request per candidate. Explicit set
+        // lookup may advertise a separately configured verified acquisition.
+        if let Some(user) = user.filter(|_| id < crate::native_maps::LOCAL_ID_MIN) {
+            let mut set = crate::native_set_metadata::set_json(state, user, id).await?;
+            crate::beatmaps::apply_private_difficulty_statuses(state, id, &mut set).await?;
+            if set["download_disabled"] == false {
+                if crate::native_maps::archive_path(state, id).await?.is_none() {
+                    return metadata_direct_set_line(id, &set).map(Some);
+                }
+                // Publication during metadata lookup switches back to the
+                // existing retained serializer, including its saved timestamp.
+            } else {
+                return Ok(None);
+            }
+        } else {
+            return Ok(None);
+        }
     }
     let rows = sqlx::query("SELECT * FROM beatmaps WHERE native_set_id=$1 ORDER BY mode,stars,id")
         .bind(id)
@@ -1141,6 +1165,51 @@ async fn direct_set_line(state: &AppState, id: i64) -> Result<Option<String>, Ap
         row.get::<chrono::DateTime<Utc>, _>("created_at")
             .format("%Y-%m-%d %H:%M:%S"),
     )))
+}
+
+fn metadata_direct_set_line(id: i64, set: &Value) -> Result<String, ApiError> {
+    let invalid = || ApiError(StatusCode::BAD_GATEWAY, "invalid_set_metadata_response");
+    if set["id"].as_i64() != Some(id) {
+        return Err(invalid());
+    }
+    let maps = set["beatmaps"]
+        .as_array()
+        .filter(|maps| !maps.is_empty() && maps.len() <= 512)
+        .ok_or_else(invalid)?;
+    let mut difficulties = Vec::with_capacity(maps.len());
+    for map in maps {
+        let stars = map["difficulty_rating"]
+            .as_f64()
+            .filter(|stars| stars.is_finite() && *stars >= 0.0)
+            .ok_or_else(invalid)?;
+        let version = map["version"].as_str().ok_or_else(invalid)?;
+        let mode = map["mode_int"]
+            .as_i64()
+            .filter(|mode| (0..=3).contains(mode))
+            .ok_or_else(invalid)?;
+        difficulties.push(format!(
+            "[{stars}*] {}@{mode}",
+            clean(version).replace(',', " ")
+        ));
+    }
+    let text = |name: &str| set[name].as_str().map(clean).ok_or_else(invalid);
+    let submitted =
+        chrono::DateTime::parse_from_rfc3339(set["submitted_date"].as_str().ok_or_else(invalid)?)
+            .map_err(|_| invalid())?
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string();
+    let status = match set["status"].as_str() {
+        Some("ranked") => 1,
+        Some("loved") => 4,
+        _ => 0,
+    };
+    Ok(format!(
+        "{id}.osz|{}|{}|{}|{status}|0|{submitted}|{id}|0|0|0|0|{}",
+        text("artist")?,
+        text("title")?,
+        text("creator")?,
+        difficulties.join(",")
+    ))
 }
 
 #[derive(Deserialize)]

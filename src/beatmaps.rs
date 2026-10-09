@@ -199,7 +199,7 @@ async fn set_lookup(
     Ok(Json(result?))
 }
 
-async fn apply_private_difficulty_statuses(
+pub(crate) async fn apply_private_difficulty_statuses(
     state: &AppState,
     set_id: i64,
     set: &mut Value,
@@ -269,19 +269,19 @@ async fn download(
     headers: HeaderMap,
     Path(id): Path<i64>,
 ) -> Result<Response, ApiError> {
-    common::bearer(&state, &headers).await?;
+    let player = common::bearer(&state, &headers).await?;
     if !crate::native_maps::valid_id(id) {
         return Err(ApiError(StatusCode::BAD_REQUEST, "invalid_beatmapset_id"));
     }
-    let path = crate::native_maps::archive_path(&state, id)
-        .await?
-        .ok_or(ApiError(StatusCode::NOT_FOUND, "archive_not_available"))?;
-    let bytes = common::stored_file(&state, &path, "maps", 104_857_600).await?;
-    crate::native_maps::require_active(&state.pool, id).await?;
+    let result = crate::native_archives::bytes(&state, id, Some(player.id)).await;
+    common::bearer(&state, &headers).await?;
+    let bytes = result?;
     Ok((
         [
             ("content-type", "application/x-osu-beatmap-archive"),
             ("content-disposition", "attachment; filename=beatmap.osz"),
+            ("cache-control", "private, no-store"),
+            ("x-content-type-options", "nosniff"),
         ],
         bytes,
     )
