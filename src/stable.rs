@@ -17,6 +17,9 @@ use serde_json::{Value, json};
 use sqlx::Row;
 use std::{collections::HashMap, net::SocketAddr};
 
+#[path = "stable_chat.rs"]
+mod chat;
+
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/web/osu-getseasonal.php", get(seasonal))
@@ -168,10 +171,9 @@ async fn login(state: &AppState, client: &str, body: &[u8]) -> Result<Response, 
     let last_chat: i64 = sqlx::query_scalar("SELECT COALESCE(max(id),0) FROM chat_messages")
         .fetch_one(&mut *tx)
         .await?;
-    let last_dm: i64 =
-        sqlx::query_scalar("SELECT COALESCE(max(id),0) FROM protocol_private_messages")
-            .fetch_one(&mut *tx)
-            .await?;
+    // Pending PM delivery belongs to the user, independently of this session.
+    // The old sequence cursor remains a compatibility field only.
+    let last_dm = 0_i64;
     let token = common::secret();
     sqlx::query("INSERT INTO bancho_sessions(id,token_hash,user_id,expires_at,last_chat_id,last_dm_id,channels,utc_offset,block_non_friend_dms,action,client_version,client_hash_hash) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)")
         .bind(uuid::Uuid::new_v4()).bind(common::token_hash(&token)).bind(player.id).bind(Utc::now()+Duration::seconds(180)).bind(last_chat).bind(last_dm).bind(&channel_ids).bind(i16::from(login.utc_offset)).bind(login.block_non_friend_dms).bind(json!(UserAction::default())).bind(&login.client_version).bind(common::token_hash(&login.client_hashes)).execute(&mut *tx).await?;
@@ -255,6 +257,8 @@ async fn poll(state: &AppState, token: &str, body: &[u8]) -> Result<Response, Ap
     // The relationship rate budget also bounds the rows a crafted batch may
     // lock. Validate every friend payload before starting any operation.
     let mut friend_targets = Vec::new();
+    let mut private_names = Vec::new();
+    let mut sends_chat = false;
     for packet in &packets {
         if matches!(
             packet.id,
@@ -264,22 +268,50 @@ async fn poll(state: &AppState, token: &str, body: &[u8]) -> Result<Response, Ap
             friend_targets.push(i64::from(reader.i32()?));
             reader.finish()?;
         }
+        if matches!(
+            packet.id,
+            wire::client::SEND_PUBLIC_MESSAGE | wire::client::SEND_PRIVATE_MESSAGE
+        ) {
+            sends_chat = true;
+        }
+        if packet.id == wire::client::SEND_PRIVATE_MESSAGE {
+            private_names.push(ChatMessage::decode(packet.payload)?.recipient);
+        }
     }
     if friend_targets.len() > 60 {
         return Err(ApiError(StatusCode::TOO_MANY_REQUESTS, "rate_limited"));
     }
+    if private_names.len() > 60 {
+        return Err(ApiError(StatusCode::TOO_MANY_REQUESTS, "rate_limited"));
+    }
     let mut tx = state.pool.begin().await?;
+    if sends_chat {
+        // Permission writers acquire this fence before users and sessions.
+        sqlx::query("LOCK TABLE roles,user_roles IN SHARE MODE")
+            .execute(&mut *tx)
+            .await?;
+    }
     let token_hash = common::token_hash(token);
     // This first read is only a lock-order hint. The token is rechecked under
     // its session lock after the user locks, matching password reset/login and
     // other relationship writers. No second transaction reacquires those rows.
     let user_id = sqlx::query_scalar::<_, i64>(
-        "SELECT user_id FROM bancho_sessions WHERE token_hash=$1 AND expires_at>now()",
+        "SELECT user_id FROM bancho_sessions WHERE token_hash=$1 AND expires_at>clock_timestamp()",
     )
     .bind(&token_hash)
     .fetch_optional(&mut *tx)
     .await?;
+    let mut incoming_ids = Vec::new();
+    let mut private_targets = HashMap::new();
     let locked_users = if let Some(user_id) = user_id {
+        for (name, target_id) in chat::outgoing_hints(&mut tx, &private_names).await? {
+            friend_targets.push(target_id);
+            private_targets.insert(name, target_id);
+        }
+        for (message_id, sender_id) in chat::incoming_hints(&mut tx, user_id).await? {
+            incoming_ids.push(message_id);
+            friend_targets.push(sender_id);
+        }
         friend_targets.push(user_id);
         friend_targets.sort_unstable();
         friend_targets.dedup();
@@ -290,18 +322,18 @@ async fn poll(state: &AppState, token: &str, body: &[u8]) -> Result<Response, Ap
     } else {
         Vec::new()
     };
-    let session = sqlx::query("SELECT user_id,channels,last_chat_id,last_dm_id,utc_offset,action FROM bancho_sessions WHERE token_hash=$1 AND user_id=$2 AND expires_at>now() FOR UPDATE").bind(&token_hash).bind(user_id).fetch_optional(&mut *tx).await?;
+    let session = sqlx::query("SELECT user_id,channels,last_chat_id,utc_offset,action,expires_at FROM bancho_sessions WHERE token_hash=$1 AND user_id=$2 FOR UPDATE").bind(&token_hash).bind(user_id).fetch_optional(&mut *tx).await?;
     let Some(session) = session else {
-        let mut output = wire::int_packet(wire::server::RESTART, 0)?;
-        append(
-            &mut output,
-            wire::string_packet(
-                wire::server::NOTIFICATION,
-                "Session expired. Please reconnect.",
-            ),
-        )?;
-        return Ok(binary(output, None));
+        return expired_session();
     };
+    let deadline: chrono::DateTime<Utc> = session.get("expires_at");
+    let alive: bool = sqlx::query_scalar("SELECT $1::timestamptz>clock_timestamp()")
+        .bind(deadline)
+        .fetch_one(&mut *tx)
+        .await?;
+    if !alive {
+        return expired_session();
+    }
     let player = common::account_in_tx(&mut tx, session.get("user_id")).await?;
     crate::multiplayer::refresh_spectator(&mut tx, player.id).await?;
     let mut channels: Vec<i64> = session.get("channels");
@@ -327,6 +359,13 @@ async fn poll(state: &AppState, token: &str, body: &[u8]) -> Result<Response, Ap
                     .bind(common::token_hash(token))
                     .execute(&mut *tx)
                     .await?;
+                let alive: bool = sqlx::query_scalar("SELECT $1::timestamptz>clock_timestamp()")
+                    .bind(deadline)
+                    .fetch_one(&mut *tx)
+                    .await?;
+                if !alive {
+                    return expired_session();
+                }
                 tx.commit().await?;
                 return Ok(binary(Vec::new(), None));
             }
@@ -454,11 +493,16 @@ async fn poll(state: &AppState, token: &str, body: &[u8]) -> Result<Response, Ap
                         }
                     }
                 } else {
-                    let recipient = sqlx::query("SELECT u.id,(COALESCE(b.block_non_friend_dms,false) OR COALESCE(u.preferences->>'pm_friends_only','false')='true') block_non_friend_dms,EXISTS(SELECT 1 FROM user_relationships WHERE user_id=u.id AND target_id=$2 AND relation_type='friend') AS friend,EXISTS(SELECT 1 FROM user_relationships WHERE ((user_id=u.id AND target_id=$2) OR (user_id=$2 AND target_id=u.id)) AND relation_type='block') AS blocked FROM users u LEFT JOIN bancho_sessions b ON b.user_id=u.id AND b.expires_at>now() WHERE lower(u.username)=lower($1) AND u.id<>$2 AND NOT u.is_restricted AND (b.id IS NOT NULL OR EXISTS(SELECT 1 FROM lazer_sessions WHERE user_id=u.id AND access_expires_at>now() AND last_seen_at>now()-interval '3 minutes'))").bind(&message.recipient).bind(player.id).fetch_optional(&mut *tx).await?;
+                    let recipient = chat::recipient(
+                        &mut tx,
+                        player.id,
+                        &message.recipient,
+                        private_targets.get(&message.recipient).copied(),
+                    )
+                    .await?;
                     if let Some(row) = recipient {
                         if !row.get::<bool, _>("blocked")
-                            && (!row.get::<bool, _>("block_non_friend_dms")
-                                || row.get::<bool, _>("friend"))
+                            && (!row.get::<bool, _>("friends_only") || row.get::<bool, _>("friend"))
                         {
                             sqlx::query("INSERT INTO protocol_private_messages(sender_id,recipient_id,content,is_action) VALUES($1,$2,$3,$4)").bind(player.id).bind(row.get::<i64,_>("id")).bind(content).bind(is_action).execute(&mut *tx).await?;
                         } else {
@@ -469,7 +513,7 @@ async fn poll(state: &AppState, token: &str, body: &[u8]) -> Result<Response, Ap
                                     &ChatMessage {
                                         sender: String::new(),
                                         text: String::new(),
-                                        recipient: message.recipient.clone(),
+                                        recipient: row.get("username"),
                                         sender_id: 0,
                                     }
                                     .encode()?,
@@ -481,7 +525,7 @@ async fn poll(state: &AppState, token: &str, body: &[u8]) -> Result<Response, Ap
                             &mut output,
                             wire::string_packet(
                                 wire::server::NOTIFICATION,
-                                "This player is offline.",
+                                "This player is unavailable.",
                             ),
                         )?;
                     }
@@ -564,30 +608,14 @@ async fn poll(state: &AppState, token: &str, body: &[u8]) -> Result<Response, Ap
             )?;
         }
     }
-    let messages = sqlx::query("SELECT m.id,m.content,m.is_action,m.sender_id,u.username,EXISTS(SELECT 1 FROM user_relationships WHERE relation_type='block' AND ((user_id=$2 AND target_id=m.sender_id) OR (target_id=$2 AND user_id=m.sender_id))) blocked FROM protocol_private_messages m JOIN users u ON u.id=m.sender_id WHERE m.id>$1 AND m.recipient_id=$2 AND NOT u.is_restricted ORDER BY m.id LIMIT 100")
-        .bind(session.get::<i64,_>("last_dm_id")).bind(player.id).fetch_all(&mut *tx).await?;
-    let mut last_dm: i64 = session.get("last_dm_id");
-    for row in messages {
-        last_dm = row.get("id");
-        if row.get::<bool, _>("blocked") {
-            continue;
-        }
-        let message = ChatMessage {
-            sender: row.get("username"),
-            text: if row.get::<bool, _>("is_action") {
-                format!("\u{1}ACTION {}\u{1}", row.get::<String, _>("content"))
-            } else {
-                row.get("content")
-            },
-            recipient: player.username.clone(),
-            sender_id: id32(row.get("sender_id"))?,
-        };
-        append(
-            &mut output,
-            wire::encode_packet(wire::server::SEND_MESSAGE, &message.encode()?),
-        )?;
-    }
-    sqlx::query("UPDATE bancho_sessions SET expires_at=$2,last_chat_id=$3,last_dm_id=$4,channels=$5,action=$6 WHERE token_hash=$1").bind(common::token_hash(token)).bind(Utc::now()+Duration::seconds(180)).bind(last_chat).bind(last_dm).bind(channels).bind(json!(action)).execute(&mut *tx).await?;
+    chat::deliver(
+        &mut tx,
+        player.id,
+        &player.username,
+        &incoming_ids,
+        &mut output,
+    )
+    .await?;
     let queued=sqlx::query("SELECT id,payload FROM bancho_packet_queue WHERE user_id=$1 AND expires_at>now() ORDER BY id LIMIT 100 FOR UPDATE SKIP LOCKED").bind(player.id).fetch_all(&mut *tx).await?;
     let mut consumed = Vec::new();
     for row in queued {
@@ -598,7 +626,26 @@ async fn poll(state: &AppState, token: &str, body: &[u8]) -> Result<Response, Ap
         .bind(consumed)
         .execute(&mut *tx)
         .await?;
+    // Use the unchanged locked deadline after all resource waits. An expired
+    // request cannot consume pending PMs or resurrect its own session.
+    let refreshed = sqlx::query("UPDATE bancho_sessions SET expires_at=$2,last_chat_id=$3,channels=$4,action=$5 WHERE token_hash=$1 AND expires_at=$6 AND expires_at>clock_timestamp()")
+        .bind(&token_hash).bind(Utc::now()+Duration::seconds(180)).bind(last_chat).bind(channels).bind(json!(action)).bind(deadline).execute(&mut *tx).await?;
+    if refreshed.rows_affected() != 1 {
+        return expired_session();
+    }
     tx.commit().await?;
+    Ok(binary(output, None))
+}
+
+fn expired_session() -> Result<Response, ApiError> {
+    let mut output = wire::int_packet(wire::server::RESTART, 0)?;
+    append(
+        &mut output,
+        wire::string_packet(
+            wire::server::NOTIFICATION,
+            "Session expired. Please reconnect.",
+        ),
+    )?;
     Ok(binary(output, None))
 }
 
