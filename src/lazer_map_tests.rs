@@ -1019,7 +1019,8 @@ fixture_test!(
         assert_ne!(local_native, collision);
         f.backend.status.store(404, Ordering::SeqCst);
         let local_search = body(
-            f.get("/api/v2/beatmapsets/search?q=Local").await,
+            f.get("/api/v2/beatmapsets/search?source=local&q=Local")
+                .await,
             StatusCode::OK,
         )
         .await;
@@ -1033,7 +1034,8 @@ fixture_test!(
         assert_eq!(local_sets[1]["id"], local_set);
         assert_eq!(local_sets[1]["beatmaps"][0]["checksum"], HASHES[4]);
         let imported_search = body(
-            f.get("/api/v2/beatmapsets/search?q=Imported").await,
+            f.get("/api/v2/beatmapsets/search?source=local&q=Imported")
+                .await,
             StatusCode::OK,
         )
         .await;
@@ -1418,7 +1420,7 @@ fixture_test!(
         assert_eq!(lookup["id"], set);
         assert_eq!(lookup["beatmaps"].as_array().unwrap().len(), 300);
         let search = body(
-            f.get("/api/v2/beatmapsets/search?q=Package%20grouping")
+            f.get("/api/v2/beatmapsets/search?source=local&q=Package%20grouping")
                 .await,
             StatusCode::OK,
         )
@@ -1531,12 +1533,30 @@ fixture_test!(
             .as_i64()
             .unwrap();
         f.backend.ingestion_status.store(503, Ordering::SeqCst);
+        let deferred_error = body(
+            f.submit(OFFICIAL_ID, received, 0, submission()).await,
+            StatusCode::SERVICE_UNAVAILABLE,
+        )
+        .await;
+        assert_eq!(deferred_error["error"], "score_ingestion_unavailable");
+        let deferred_intent = sqlx::query("SELECT submission,processing_status,score_id,processing_error,retry_at>now() AS retry_deferred FROM lazer_score_tokens WHERE id=$1")
+            .bind(received).fetch_one(&f.state.pool).await.unwrap();
+        let expected_payload: resonance_protocol::lazer::SoloScoreSubmission =
+            serde_json::from_value(submission()).unwrap();
         assert_eq!(
-            f.submit(OFFICIAL_ID, received, 0, submission())
-                .await
-                .status(),
-            StatusCode::BAD_REQUEST
+            deferred_intent.get::<Value, _>("submission"),
+            json!(expected_payload)
         );
+        assert_eq!(
+            deferred_intent.get::<String, _>("processing_status"),
+            "received"
+        );
+        assert!(deferred_intent.get::<Option<i64>, _>("score_id").is_none());
+        assert_eq!(
+            deferred_intent.get::<String, _>("processing_error"),
+            "score_ingestion_unavailable"
+        );
+        assert!(deferred_intent.get::<bool, _>("retry_deferred"));
         f.backend.ingestion_status.store(200, Ordering::SeqCst);
         let received_before:Value=sqlx::query_scalar("SELECT jsonb_build_object('submission',submission,'status',processing_status,'received_at',received_at) FROM lazer_score_tokens WHERE id=$1").bind(received).fetch_one(&f.state.pool).await.unwrap();
         let accepted = body(
@@ -1592,7 +1612,11 @@ fixture_test!(
             StatusCode::GONE
         );
         assert_eq!(
-            body(f.get("/api/v2/beatmapsets/search").await, StatusCode::OK).await["total"],
+            body(
+                f.get("/api/v2/beatmapsets/search?source=local").await,
+                StatusCode::OK
+            )
+            .await["total"],
             0
         );
         assert!(

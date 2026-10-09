@@ -212,7 +212,20 @@ pub(crate) async fn retained_map_json(
         .fetch_one(&state.pool)
         .await?;
     let disabled = !active || retained_archive_path(state, set).await?.is_none();
-    let mut output = json!({"id":id,"beatmapset_id":set,"checksum":row.get::<String,_>("md5"),"version":row.get::<String,_>("version"),"mode":(["osu","taiko","fruits","mania"][mode]),"mode_int":mode,"status":status,"ranked":if status=="ranked"{1}else if status=="loved"{4}else{0},"difficulty_rating":row.get::<f64,_>("stars"),"bpm":row.get::<f64,_>("bpm"),"total_length":row.get::<i32,_>("length_seconds"),"hit_length":row.get::<i32,_>("length_seconds"),"max_combo":row.get::<i32,_>("max_combo"),"user_id":row.get::<Option<i64>,_>("uploaded_by").unwrap_or(0),"is_scoreable":true,"url":format!("/beatmaps/{internal}"),"beatmapset":{"id":set,"artist":row.get::<String,_>("artist"),"artist_unicode":row.get::<String,_>("artist"),"title":row.get::<String,_>("title"),"title_unicode":row.get::<String,_>("title"),"creator":row.get::<String,_>("creator"),"status":status,"user_id":row.get::<Option<i64>,_>("uploaded_by").unwrap_or(0),"covers":{"cover":"","cover@2x":"","card":"","card@2x":"","list":"","list@2x":"","slimcover":"","slimcover@2x":""},"preview_url":"","download_disabled":disabled,"video":false,"storyboard":false,"availability":{"download_disabled":disabled,"more_information":null},"beatmaps":[]}});
+    let rank = match status {
+        "graveyard" => -2,
+        "wip" => -1,
+        "pending" => 0,
+        "ranked" => 1,
+        "loved" => 4,
+        _ => {
+            return Err(ApiError(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "invalid_stored_beatmap_status",
+            ));
+        }
+    };
+    let mut output = json!({"id":id,"beatmapset_id":set,"checksum":row.get::<String,_>("md5"),"version":row.get::<String,_>("version"),"mode":(["osu","taiko","fruits","mania"][mode]),"mode_int":mode,"status":status,"ranked":rank,"difficulty_rating":row.get::<f64,_>("stars"),"bpm":row.get::<f64,_>("bpm"),"total_length":row.get::<i32,_>("length_seconds"),"hit_length":row.get::<i32,_>("length_seconds"),"max_combo":row.get::<i32,_>("max_combo"),"user_id":row.get::<Option<i64>,_>("uploaded_by").unwrap_or(0),"is_scoreable":true,"url":format!("/beatmaps/{internal}"),"beatmapset":{"id":set,"artist":row.get::<String,_>("artist"),"artist_unicode":row.get::<String,_>("artist"),"title":row.get::<String,_>("title"),"title_unicode":row.get::<String,_>("title"),"creator":row.get::<String,_>("creator"),"status":status,"user_id":row.get::<Option<i64>,_>("uploaded_by").unwrap_or(0),"covers":{"cover":"","cover@2x":"","card":"","card@2x":"","list":"","list@2x":"","slimcover":"","slimcover@2x":""},"preview_url":"","download_disabled":disabled,"video":false,"storyboard":false,"availability":{"download_disabled":disabled,"more_information":null},"beatmaps":[]}});
     output["is_scoreable"] = json!(active);
     output["beatmapset"]["availability"]["withdrawn"] = json!(!active);
     Ok(output)
@@ -275,7 +288,7 @@ impl Identity {
             }
             && matches!(
                 self.status.as_str(),
-                "pending" | "ranked" | "loved" | "unranked"
+                "pending" | "ranked" | "loved" | "unranked" | "graveyard" | "wip"
             )
             && matches!(self.source.as_str(), "local" | "official")
             && (0..=3).contains(&self.mode)
@@ -570,6 +583,10 @@ mod tests {
         identity.official_id = None;
         identity.source = "local".into();
         assert!(identity.valid_for(&checksum));
+        for status in ["graveyard", "wip", "pending", "unranked"] {
+            identity.status = status.into();
+            assert!(identity.valid_for(&checksum), "{status}");
+        }
         assert!(!identity.valid_for(&Selector::OfficialId(700001)));
         identity.md5 = "not-a-checksum".into();
         assert!(!identity.valid_for(&Selector::OfficialId(700001)));

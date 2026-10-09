@@ -144,6 +144,38 @@ def reject_score_review(admin, score_id, verification, revision, *, status, code
     assert admin.json("GET", "/api/v1/admin/audit") == audit_before
 
 
+def map_status_state(beatmap, map_id):
+    """Read authoritative stored-map and override revisions without defaults."""
+    keys = ("id", "native_id", "native_set_id", "status", "status_revision", "status_override_revision")
+    current = {key: beatmap[key] for key in keys}
+    assert type(current["id"]) is int and current["id"] == map_id, current
+    for key in ("native_id", "native_set_id"):
+        assert type(current[key]) is int and current[key] > 0, (map_id, "invalid native identity", key)
+    for key in ("status_revision", "status_override_revision"):
+        assert type(current[key]) is int and current[key] >= 0, (map_id, "invalid status revision", key)
+    assert current["status"] in ("pending", "ranked", "loved", "unranked", "graveyard", "wip"), current
+    return current
+
+
+def review_map_status(admin, map_id, status, *, from_status):
+    """One explicit difficulty transition using both fresh revisions; no retry."""
+    current = map_status_state(admin.json("GET", f"/api/v1/beatmaps/{map_id}"), map_id)
+    assert current["status"] == from_status, current
+    assert status != from_status, (map_id, "map fixture must change status")
+    assert status in ("pending", "ranked", "loved", "unranked", "graveyard", "wip")
+    reviewed = map_status_state(admin.json("PATCH", f"/api/v1/admin/beatmaps/{map_id}", {
+        "status": status,
+        "expected_revision": current["status_override_revision"],
+        "expected_status_revision": current["status_revision"],
+    }), map_id)
+    for key in ("native_id", "native_set_id"):
+        assert reviewed[key] == current[key], reviewed
+    assert reviewed["status"] == status, reviewed
+    for key in ("status_revision", "status_override_revision"):
+        assert reviewed[key] == current[key] + 1, reviewed
+    return reviewed
+
+
 def wire_string(text):
     raw = text.encode()
     size = len(raw)
@@ -647,7 +679,7 @@ def run():
     body, headers = multipart([], [("file", "protocol.osz", archive)])
     uploaded = admin.json("POST", "/api/v1/beatmaps/upload", body, headers)["items"]
     assert len(uploaded) == 2
-    assert all(item["status"] == "pending" for item in uploaded), "New local package was not pending"
+    assert all(item["status"] == "graveyard" for item in uploaded), "New local package was not graveyard"
     retry_items = admin.json("POST", "/api/v1/beatmaps/upload", body, headers)["items"]
     assert {(item["id"], item["native_id"], item["native_set_id"], item["local_package_id"]) for item in retry_items} == {(item["id"], item["native_id"], item["native_set_id"], item["local_package_id"]) for item in uploaded}
     beatmap = next(item for item in uploaded if item["md5"] == hashlib.md5(fixture).hexdigest())
@@ -670,7 +702,7 @@ def run():
     required_summary_keys = {"id", "title", "artist", "creator", "version", "mode", "status", "source", "stars", "length_seconds"}
     for summary in summaries:
         assert required_summary_keys <= set(summary) <= required_summary_keys | {"bpm", "max_combo"}
-        assert summary["status"] == "pending"
+        assert summary["status"] == "graveyard"
     assert public_map["download_url"] == f"/api/v1/beatmaps/{map_pk}/download"
     assert anonymous.request("GET", public_map["download_url"])[0] == archive
     assert anonymous.request("GET", f"/api/v1/beatmaps/{map_pk}/osu")[0] == fixture
@@ -733,7 +765,7 @@ def run():
     grouped = gateway.json("GET", f"/api/v2/beatmapsets/{set_id}", headers=bearer)
     assert {item["checksum"] for item in grouped["beatmaps"]} == {map_hash, sibling["md5"]}
     assert gateway.json("GET", f"/api/v2/beatmapsets/lookup?beatmap_id={sibling['native_id']}", headers=bearer)["id"] == set_id
-    package_search = gateway.json("GET", "/api/v2/beatmapsets/search?q=Protocol%20fixture", headers=bearer)
+    package_search = gateway.json("GET", "/api/v2/beatmapsets/search?source=local&q=Protocol%20fixture", headers=bearer)
     assert package_search["total"] == 1 and package_search["beatmapsets"][0]["id"] == set_id
     assert gateway.request("GET", f"/api/v2/beatmapsets/{set_id}/download", headers=bearer)[0] == archive
     assert gateway.request("GET", f"/d/{set_id}")[0] == archive
@@ -743,7 +775,7 @@ def run():
     gateway.request("GET", "/api/v2/beatmaps/2147483647", headers=bearer, expected=404)
     gateway.request("GET", f"/api/v2/beatmaps/lookup?id=2147483647&checksum={'f' * 32}", headers=bearer, expected=404)
     direct_auth = {"u": player_name, "h": digest(player_password)}
-    direct = gateway.request("GET", "/web/osu-search.php?" + urllib.parse.urlencode(dict(direct_auth, q="Protocol fixture")))[0].decode()
+    direct = gateway.request("GET", "/web/osu-search.php?" + urllib.parse.urlencode(dict(direct_auth, source="local", q="Protocol fixture")))[0].decode()
     assert direct.splitlines()[0] == "1" and direct.splitlines()[1].startswith(f"{set_id}.osz|")
     assert "Easy@0" in direct and "Sibling@0" in direct
     for selector, identity in [("b", map_id), ("b", sibling["native_id"]), ("s", set_id)]:
@@ -823,14 +855,14 @@ def run():
         assert not lazer["ranked"], score_state(lazer)
         anonymous.request("GET", f"/api/v1/scores/{lazer['id']}", expected=404)
         solo_capture.call("EndPlaySessionV2", [token, 3])
-        # UserScoreProcessed belongs to processed room tokens. Solo completion
-        # is synchronous and its persisted score/replay are the authority.
-        solo_capture.no_event("UserScoreProcessed")
+        # Solo and room receipts notify the exact ended submitting connection.
+        assert solo_capture.event("UserScoreProcessed") == [player_id, lazer["id"]]
         completed_lazer = gateway.json("GET", f"/api/v2/scores/{lazer['id']}", headers=bearer)
         assert completed_lazer["verification"] == "verified", score_state(completed_lazer)
         assert completed_lazer["has_replay"], score_state(completed_lazer)
         assert anonymous.json("GET", f"/api/v1/scores/{lazer['id']}")["verification"] == "verified"
         assert gateway.json("PUT", path, score, bearer)["verification"] == "verified"
+        solo_capture.no_event("UserScoreProcessed")
         # Keep the mixed-client ranking fixture pending until its explicit
         # moderation step below, and prove a native retry cannot undo that choice.
         review_score(admin, lazer["id"], "pending", from_status="verified")
@@ -839,7 +871,7 @@ def run():
     assert lazer_retry["id"] == lazer["id"], score_state(lazer_retry)
     assert lazer_retry["verification"] == "pending", score_state(lazer_retry)
     gateway.request("PUT", path, dict(score, total_score=999999), bearer, expected=409)
-    admin.json("PATCH", f"/api/v1/admin/beatmaps/{map_pk}", {"status": "ranked"})
+    review_map_status(admin, map_pk, "ranked", from_status="graveyard")
 
     played_at = datetime.datetime.now(datetime.timezone.utc).strftime("%y%m%d%H%M%S")
     stable_raw = 600  # Two Great circles, no legacy combo bonus.
@@ -1089,7 +1121,7 @@ def run():
     upload_body, upload_headers = multipart([], [("file", "independent-rx.osz", rx_archive.getvalue())])
     rx_map = admin.json("POST", "/api/v1/beatmaps/upload", upload_body, upload_headers)["items"][0]
     map_pk, map_id, set_id, map_hash = rx_map["id"], rx_map["native_id"], rx_map["native_set_id"], rx_map["md5"]
-    admin.json("PATCH", f"/api/v1/admin/beatmaps/{map_pk}", {"status": "ranked"})
+    review_map_status(admin, map_pk, "ranked", from_status="graveyard")
     assert gateway.request("GET", f"/osu/{map_id}")[0] == rx_fixture
     frames = lzma.compress(("".join(f"{1000 if index == 0 else 240}|{x}|{y}|1," for index, (x, y, _) in enumerate(rx_objects)) + "-12345|0|0|12345,").encode(), format=lzma.FORMAT_ALONE)
     fields = [(name, map_hash if name == "bmk" else value) for name, value in fields]
@@ -1351,8 +1383,8 @@ def run():
     for selector, identity in [("b", map_id), ("s", set_id), ("c", map_hash)]:
         denial = gateway.json("GET", "/web/osu-search-set.php?" + urllib.parse.urlencode(dict(direct_auth, **{selector: identity})), expected=410)
         assert denial["error"] == "beatmap_withdrawn"
-    assert gateway.request("GET", "/web/osu-search.php?" + urllib.parse.urlencode(dict(direct_auth, q=rx_map["title"])))[0] == b"0\n"
-    assert gateway.json("GET", "/api/v2/beatmapsets/search?" + urllib.parse.urlencode({"q": rx_map["title"]}), headers=bearer)["total"] == 0
+    assert gateway.request("GET", "/web/osu-search.php?" + urllib.parse.urlencode(dict(direct_auth, source="local", q=rx_map["title"])))[0] == b"0\n"
+    assert gateway.json("GET", "/api/v2/beatmapsets/search?" + urllib.parse.urlencode({"source": "local", "q": rx_map["title"]}), headers=bearer)["total"] == 0
     gateway.request("POST", f"/api/v2/beatmaps/{map_id}/solo/scores", nm_token_fields,
                     dict(bearer, **{"Content-Type": "application/x-www-form-urlencoded"}), expected=410)
     gateway.request("PUT", pending_path, nm_payload, bearer, expected=410)
@@ -1478,7 +1510,7 @@ def run():
     cp932_created = admin.json("POST", "/api/v1/beatmaps/upload", cp932_body, cp932_headers)
     assert cp932_created["idempotent"] is False
     cp932_uploaded = cp932_created["items"]
-    assert len(cp932_uploaded) == 2 and all(item["status"] == "pending" for item in cp932_uploaded)
+    assert len(cp932_uploaded) == 2 and all(item["status"] == "graveyard" for item in cp932_uploaded)
     cp932_retried = admin.json("POST", "/api/v1/beatmaps/upload", cp932_body, cp932_headers)
     assert cp932_retried["idempotent"] is True and cp932_retried["package"] == cp932_created["package"]
     cp932_retry = cp932_retried["items"]
