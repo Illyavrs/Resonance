@@ -819,6 +819,7 @@ async fn room_round_lifecycle_tokens_history_and_http_results() {
         proof("actual-score.json",&accepted);
         let score=accepted["id"].as_i64().unwrap();
         assert_eq!(accepted["verification"],"pending");assert_eq!(accepted["processed"],true);assert_eq!(accepted["ranked"],false);
+        f.get(1,&format!("/api/v2/scores/{score}"),404).await;
         let event=metadata.event("MultiplayerRoomScoreSet").await;
         assert_eq!(event,json!([[room,1,score,f.users[0],1_000_000,1]]));
         proof("actual-event.json",&event[0]);
@@ -838,9 +839,10 @@ async fn room_round_lifecycle_tokens_history_and_http_results() {
         host.event("ResultsReady").await;
         assert_eq!(sqlx::query_scalar::<_,String>("SELECT status FROM lazer_room_rounds WHERE id=$1").bind(round).fetch_one(&f.state.pool).await.unwrap(),"finished");
         assert_eq!(f.count("SELECT count(*) FROM scores").await,1);
-        let pending=f.get(1,&format!("/api/v2/rooms/{room}/playlist/1/scores/{score}"),200).await;
-        assert_eq!(pending["id"],score);assert!(pending["scores_around"].is_object());
-        f.get(1,&format!("/api/v2/scores/{score}"),404).await;
+        let completed=f.get(1,&format!("/api/v2/rooms/{room}/playlist/1/scores/{score}"),200).await;
+        assert_eq!(completed["id"],score);assert!(completed["scores_around"].is_object());
+        assert_eq!(completed["verification"],"verified");assert_eq!(completed["replay_complete"],true);
+        assert_eq!(f.get(1,&format!("/api/v2/scores/{score}"),200).await["verification"],"verified");
         f.get(1,&format!("/api/v2/rooms/{room}/playlist/2/scores/{score}"),404).await;
         let board=f.get(1,&format!("/api/v2/rooms/{room}/leaderboard"),200).await;
         proof("actual-aggregate.json",&board["leaderboard"][0]);

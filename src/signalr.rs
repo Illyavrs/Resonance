@@ -2757,7 +2757,37 @@ async fn metadata(
     }
 }
 
-/// Called after an end registration or committed room outbox event. The caller
+/// Dispatch an exact ended-token receipt after score processing commits.
+pub(crate) async fn publish_processed_score(state: &AppState, token: i64) -> Result<(), ApiError> {
+    let _dispatch = state.signalr.score_event_dispatch.lock().await;
+    notify_ended_score(state, token).await
+}
+
+/// Retry ended callbacks after a temporary lookup failure. Only committed
+/// receipts enter the bounded batch; unsubmitted plays cannot block delivery.
+pub(crate) async fn publish_pending_processed_scores(state: &AppState) -> Result<(), ApiError> {
+    let _dispatch = state.signalr.score_event_dispatch.lock().await;
+    let tokens: Vec<i64> = {
+        let mut ended = state.signalr.ended_plays.lock().await;
+        ended.retain(|_, play| play.registered.elapsed() < Duration::from_secs(6 * 60 * 60));
+        ended.keys().copied().collect()
+    };
+    if tokens.is_empty() {
+        return Ok(());
+    }
+    let ready: Vec<i64> = sqlx::query_scalar("SELECT id FROM lazer_score_tokens WHERE id=ANY($1) AND score_id IS NOT NULL AND processing_status='processed' AND revoked_at IS NULL ORDER BY id LIMIT 64")
+        .bind(tokens).fetch_all(&state.pool).await?;
+    for token in ready {
+        notify_ended_score(state, token).await?;
+        // A committed receipt that fails its delivery guards is terminal for
+        // this watcher. Clear it too, so rejected/malformed low IDs cannot
+        // monopolize later batches; lookup errors above retain their retry.
+        state.signalr.ended_plays.lock().await.remove(&token);
+    }
+    Ok(())
+}
+
+/// Called after an end registration or committed solo/room score receipt. The caller
 /// holds the dispatch mutex, never a database transaction. Only the exact ended
 /// submitting connection receives this two-scalar callback.
 async fn notify_ended_score(state: &AppState, token: i64) -> Result<(), ApiError> {
@@ -2782,8 +2812,11 @@ async fn notify_ended_score(state: &AppState, token: i64) -> Result<(), ApiError
         state.signalr.ended_plays.lock().await.remove(&token);
         return Ok(());
     }
-    let Some(score) = crate::room_scores::processed_score_id(state, ended.user_id, token).await?
-    else {
+    let score = match crate::lazer::processed_solo_score_id(state, ended.user_id, token).await? {
+        Some(score) => Some(score),
+        None => crate::room_scores::processed_score_id(state, ended.user_id, token).await?,
+    };
+    let Some(score) = score else {
         return Ok(());
     };
     let Ok(user) = i32::try_from(ended.user_id) else {

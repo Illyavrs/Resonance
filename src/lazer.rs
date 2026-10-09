@@ -15,6 +15,12 @@ use resonance_protocol::lazer::{
 use serde::{Deserialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use sqlx::Row;
+#[path = "lazer_solo.rs"]
+mod solo_scores;
+pub(crate) use solo_scores::{
+    processed_score_id as processed_solo_score_id, recover_pending as recover_solo_scores,
+};
+
 use std::{
     collections::{HashMap, HashSet},
     net::SocketAddr,
@@ -556,142 +562,13 @@ async fn submit_score(
     Json(input): Json<SoloScoreSubmission>,
 ) -> Result<Json<Value>, ApiError> {
     let player = common::bearer(&state, &headers).await?;
-    input.validate()?;
-    if !crate::native_maps::valid_id(map_id) || token_id <= 0 {
-        return Err(ApiError(StatusCode::BAD_REQUEST, "invalid_score_token"));
+    let score_id =
+        solo_scores::submit(&state, &headers, player.id, map_id, token_id, &input).await?;
+    let current = common::bearer(&state, &headers).await?;
+    if current.id != player.id {
+        return Err(ApiError(StatusCode::UNAUTHORIZED, "invalid_token"));
     }
-    let mods = illya_domain::score_mods::ValidatedMods::parse(input.ruleset_id, &json!(input.mods))
-        .map_err(|_| ApiError(StatusCode::BAD_REQUEST, "invalid_score_mods"))?
-        .legacy_bits;
-    if state.service_key.len() < 32 {
-        return Err(ApiError(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "internal_ingestion_not_configured",
-        ));
-    }
-    let mut tx = state.pool.begin().await?;
-    common::lazer_account_in_tx(&mut tx, &headers, player.id).await?;
-    let token=sqlx::query("SELECT t.* FROM lazer_score_tokens t JOIN beatmaps b ON b.id=t.beatmap_id WHERE t.id=$1 AND t.user_id=$2 AND t.scope='solo' AND b.native_id=$3 AND (t.expires_at>now() OR t.score_id IS NOT NULL) FOR UPDATE OF t").bind(token_id).bind(player.id).bind(map_id).fetch_optional(&mut *tx).await?.ok_or(ApiError(StatusCode::NOT_FOUND,"invalid_score_token"))?;
-    let map_id: i64 = token.get("beatmap_id");
-    if token.get::<i16, _>("ruleset_id") != i16::from(input.ruleset_id) {
-        return Err(ApiError(StatusCode::BAD_REQUEST, "score_ruleset_mismatch"));
-    }
-    let submission = json!(input);
-    if token
-        .get::<Option<Value>, _>("submission")
-        .is_some_and(|previous| previous != submission)
-    {
-        return Err(ApiError(StatusCode::CONFLICT, "score_token_already_used"));
-    }
-    if token
-        .get::<Option<chrono::DateTime<Utc>>, _>("revoked_at")
-        .is_some()
-    {
-        return Err(ApiError(StatusCode::BAD_REQUEST, "score_token_revoked"));
-    }
-    let variant = ScoreVariant::from_legacy(input.ruleset_id, mods)
-        .map_err(|_| ApiError(StatusCode::BAD_REQUEST, "invalid_score_variant"))?;
-    if token.get::<Option<i64>, _>("score_id").is_none()
-        && let Err(error) = crate::native_maps::lock_score_admission(
-            &mut tx,
-            token_id,
-            player.id,
-            map_id,
-            i16::from(input.ruleset_id),
-            variant,
-        )
-        .await
-    {
-        if error.0 == StatusCode::GONE && token.get::<String, _>("processing_status") == "received"
-        {
-            sqlx::query("UPDATE lazer_score_tokens SET processing_error='beatmap_withdrawn',retry_at=now()+interval '5 minutes' WHERE id=$1 AND scope='solo' AND score_id IS NULL")
-                .bind(token_id).execute(&mut *tx).await?;
-            tx.commit().await?;
-        }
-        return Err(error);
-    }
-    // Persist the exact intent before releasing every database lock for HTTP.
-    // Withdrawal cannot discard an accepted intent or create an unbound retry.
-    sqlx::query("UPDATE lazer_score_tokens SET submission=$2,received_at=COALESCE(received_at,now()),processing_status=CASE WHEN score_id IS NULL THEN 'received' ELSE processing_status END WHERE id=$1")
-        .bind(token_id).bind(&submission).execute(&mut *tx).await?;
-    let previous_score = token.get::<Option<i64>, _>("score_id");
-    tx.commit().await?;
-    let score_id = if let Some(score_id) = previous_score {
-        score_id
-    } else {
-        let response=state.http.post(format!("{}/api/v1/internal/scores",state.sanctuary_url.trim_end_matches('/'))).header("x-illya-service-key",state.service_key.as_str()).json(&json!({"user_id":player.id,"beatmap_id":map_id,"mode":input.ruleset_id,"score":input.total_score,"accuracy":input.accuracy*100.0,"max_combo":input.max_combo,"mods":mods,"api_mods":input.mods,"passed":input.passed,"hit_counts":input.legacy_hit_counts(),"native_submission":input,"client":"lazer","ingestion_key":format!("lazer:{token_id}")})).send().await.map_err(|_|ApiError(StatusCode::SERVICE_UNAVAILABLE,"score_ingestion_unavailable"))?;
-        if !response.status().is_success() {
-            if response.status() == StatusCode::GONE {
-                sqlx::query("UPDATE lazer_score_tokens SET processing_error='beatmap_withdrawn' WHERE id=$1 AND scope='solo' AND score_id IS NULL").bind(token_id).execute(&state.pool).await?;
-                return Err(ApiError(StatusCode::GONE, "beatmap_withdrawn"));
-            }
-            return Err(ApiError(
-                StatusCode::BAD_REQUEST,
-                "score_rejected_by_ingestion",
-            ));
-        }
-        let result: Value = response
-            .json()
-            .await
-            .map_err(|_| ApiError(StatusCode::BAD_GATEWAY, "invalid_ingestion_response"))?;
-        let score_id = result.get("id").and_then(Value::as_i64).ok_or(ApiError(
-            StatusCode::BAD_GATEWAY,
-            "invalid_ingestion_response",
-        ))?;
-        let mut tx = state.pool.begin().await?;
-        common::lazer_account_in_tx(&mut tx, &headers, player.id).await?;
-        let current = sqlx::query("SELECT submission,score_id,expires_at,revoked_at FROM lazer_score_tokens WHERE id=$1 AND user_id=$2 AND scope='solo' AND beatmap_id=$3 AND ruleset_id=$4 FOR UPDATE")
-            .bind(token_id).bind(player.id).bind(map_id).bind(i16::from(input.ruleset_id)).fetch_optional(&mut *tx).await?
-            .ok_or(ApiError(StatusCode::NOT_FOUND, "invalid_score_token"))?;
-        if current.get::<Option<Value>, _>("submission").as_ref() != Some(&submission)
-            || current
-                .get::<Option<i64>, _>("score_id")
-                .is_some_and(|saved| saved != score_id)
-        {
-            return Err(ApiError(StatusCode::CONFLICT, "score_token_already_used"));
-        }
-        if current
-            .get::<Option<chrono::DateTime<Utc>>, _>("revoked_at")
-            .is_some()
-            || (current.get::<chrono::DateTime<Utc>, _>("expires_at") <= Utc::now()
-                && current.get::<Option<i64>, _>("score_id").is_none())
-        {
-            return Err(ApiError(StatusCode::BAD_REQUEST, "score_token_expired"));
-        }
-        let saved = sqlx::query("SELECT native_submission,user_id,beatmap_id,mode,client,ingestion_key FROM scores WHERE id=$1 FOR SHARE")
-            .bind(score_id).fetch_optional(&mut *tx).await?.ok_or(ApiError(StatusCode::BAD_GATEWAY, "invalid_ingestion_response"))?;
-        if saved.get::<i64, _>("user_id") != player.id
-            || saved.get::<i64, _>("beatmap_id") != map_id
-            || saved.get::<i16, _>("mode") != i16::from(input.ruleset_id)
-            || saved.get::<String, _>("client") != "lazer"
-            || saved.get::<Option<String>, _>("ingestion_key").as_deref()
-                != Some(format!("lazer:{token_id}").as_str())
-            || saved.get::<Option<Value>, _>("native_submission").as_ref() != Some(&submission)
-        {
-            return Err(ApiError(
-                StatusCode::CONFLICT,
-                "score_ingestion_link_mismatch",
-            ));
-        }
-        sqlx::query(
-            "UPDATE lazer_score_tokens SET consumed_at=now(),score_id=$2,submission=$3,processing_status='processed',processing_error=NULL WHERE id=$1",
-        )
-        .bind(token_id)
-        .bind(score_id)
-        .bind(&submission)
-        .execute(&mut *tx)
-        .await?;
-        tx.commit().await?;
-        score_id
-    };
-    if let Err(error) = crate::replay_capture::finalize(&state, player.id, token_id).await {
-        tracing::warn!(
-            score_id,
-            code = error.1,
-            "submitted score replay not published"
-        );
-    }
-    let mut result = score_json(&state, score_id, &player).await?;
+    let mut result = score_json(&state, score_id, &current).await?;
     result["mods"] = json!(input.mods);
     result["statistics"] = json!(input.statistics);
     result["maximum_statistics"] = json!(input.maximum_statistics);

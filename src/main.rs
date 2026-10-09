@@ -86,6 +86,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ),
     };
     state.lazer_chat.start(pool).await?;
+    if let Err(error) = lazer::recover_solo_scores(&state).await {
+        tracing::warn!(
+            code = error.1,
+            "solo score recovery will retry in background"
+        );
+    }
     if let Err(error) = room_scores::recover_pending(&state).await {
         tracing::warn!(
             code = error.1,
@@ -105,6 +111,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         interval.tick().await;
         loop {
             interval.tick().await;
+            if let Err(error) = lazer::recover_solo_scores(&recovery_state).await {
+                tracing::warn!(code = error.1, "solo score recovery batch failed");
+            }
             if let Err(error) = room_scores::recover_pending(&recovery_state).await {
                 tracing::warn!(code = error.1, "room score recovery batch failed");
             }
