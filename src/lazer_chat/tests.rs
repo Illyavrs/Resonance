@@ -7,6 +7,34 @@ use tokio_tungstenite::{
 
 #[path = "reconnect_tests.rs"]
 mod reconnect;
+#[path = "silence_tests.rs"]
+mod timed_silence;
+
+#[tokio::test]
+async fn timed_silence_http_error_contains_factual_duration_and_stable_code() {
+    let until = chrono::DateTime::parse_from_rfc3339("2026-10-09T18:00:00Z")
+        .unwrap()
+        .with_timezone(&Utc);
+    let response = ChatSendError::Silenced(crate::native_chat::Silence {
+        until,
+        remaining_seconds: 42,
+    })
+    .into_response();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let bytes = axum::body::to_bytes(response.into_body(), 8192)
+        .await
+        .unwrap();
+    let error: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(error["error"], "chat_silenced");
+    assert_eq!(error["remaining_seconds"], 42);
+    assert_eq!(error["silenced_until"], json!(until));
+    assert!(
+        error["message"]
+            .as_str()
+            .unwrap()
+            .contains("42 more seconds")
+    );
+}
 
 #[test]
 fn native_commands_have_no_arbitrary_payload_or_unbounded_frames() {

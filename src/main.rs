@@ -8,6 +8,7 @@ mod lazer_chat;
 #[cfg(test)]
 mod lazer_map_tests;
 mod multiplayer;
+mod native_chat;
 #[cfg(test)]
 mod native_map_tests;
 mod native_maps;

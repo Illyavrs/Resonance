@@ -7,7 +7,7 @@ use axum::{
         ws::{Message, WebSocket},
     },
     http::{HeaderMap, StatusCode},
-    response::Response,
+    response::{IntoResponse, Response},
     routing::{get, post, put},
 };
 use chrono::Utc;
@@ -249,7 +249,12 @@ async fn channel_json(state: &AppState, user: &Account, row: &PgRow) -> Result<V
     .bind(user.id)
     .fetch_optional(&state.pool)
     .await?;
-    let can_message = user.can("chat.send")
+    let silence = {
+        let mut db = state.pool.acquire().await?;
+        crate::native_chat::silence(&mut db, user.id).await?
+    };
+    let can_message = silence.is_none()
+        && user.can("chat.send")
         && (!private
             || pm_can_send(
                 state,
@@ -270,7 +275,7 @@ async fn channel_json(state: &AppState, user: &Account, row: &PgRow) -> Result<V
         "PUBLIC"
     };
     Ok(
-        json!({"channel_id":id,"name":name,"description":row.get::<String,_>("description"),"type":kind,"icon":icon,"moderated":false,"message_length_limit":1000,"last_message_id":if last>0{Some(last)}else{None},"last_read_id":read,"current_user_attributes":{"can_message":can_message,"can_message_error":if can_message{None}else{Some("chat_permission_required")},"last_read_id":read},"users":users}),
+        json!({"channel_id":id,"name":name,"description":row.get::<String,_>("description"),"type":kind,"icon":icon,"moderated":false,"message_length_limit":1000,"last_message_id":if last>0{Some(last)}else{None},"last_read_id":read,"current_user_attributes":{"can_message":can_message,"can_message_error":if can_message{None}else if silence.is_some(){Some("chat_silenced")}else{Some("chat_permission_required")},"last_read_id":read},"users":users}),
     )
 }
 async fn joined(state: &AppState, user: &Account) -> Result<HashMap<i64, Value>, ApiError> {
@@ -443,15 +448,95 @@ impl ChatInput {
         Ok((content, uuid))
     }
 }
+#[derive(Debug)]
+enum ChatSendError {
+    Api(ApiError),
+    Silenced(crate::native_chat::Silence),
+}
+impl From<ApiError> for ChatSendError {
+    fn from(error: ApiError) -> Self {
+        Self::Api(error)
+    }
+}
+impl From<sqlx::Error> for ChatSendError {
+    fn from(error: sqlx::Error) -> Self {
+        Self::Api(error.into())
+    }
+}
+impl IntoResponse for ChatSendError {
+    fn into_response(self) -> Response {
+        match self {
+            Self::Api(error) => error.into_response(),
+            Self::Silenced(silence) => (StatusCode::FORBIDDEN, Json(json!({
+                "error":"chat_silenced",
+                "message":format!("Chat is silenced for {} more seconds. You can still read messages and play.", silence.remaining_seconds),
+                "remaining_seconds":silence.remaining_seconds,
+                "silenced_until":silence.until,
+            }))).into_response(),
+        }
+    }
+}
+async fn require_send_unsilenced(
+    db: &mut sqlx::PgConnection,
+    user: i64,
+) -> Result<(), ChatSendError> {
+    if let Some(silence) = crate::native_chat::silence(db, user).await? {
+        return Err(ChatSendError::Silenced(silence));
+    }
+    Ok(())
+}
+async fn accepted_message(
+    db: &mut sqlx::PgConnection,
+    user: i64,
+    channel: i64,
+    content: &str,
+    action: bool,
+    uuid: Option<&str>,
+) -> Result<Option<Value>, ChatSendError> {
+    if let Some(uuid) = uuid
+        && let Some(existing) =
+            sqlx::query("SELECT * FROM chat_messages WHERE user_id=$1 AND client_uuid=$2")
+                .bind(user)
+                .bind(uuid)
+                .fetch_optional(db)
+                .await?
+    {
+        if existing.get::<i64, _>("channel_id") != channel
+            || existing.get::<String, _>("content") != content
+            || existing.get::<bool, _>("is_action") != action
+        {
+            return Err(ApiError(StatusCode::CONFLICT, "message_uuid_conflict").into());
+        }
+        return Ok(Some(message_json(&existing)));
+    }
+    Ok(None)
+}
+async fn store_private(
+    db: &mut sqlx::PgConnection,
+    sender: i64,
+    recipient: i64,
+    content: &str,
+    action: bool,
+    uuid: Option<&str>,
+) -> Result<PgRow, ChatSendError> {
+    require_send_unsilenced(db, sender).await?;
+    let private_id:i64=sqlx::query_scalar("INSERT INTO protocol_private_messages(sender_id,recipient_id,content,is_action,client_uuid) VALUES($1,$2,$3,$4,$5) RETURNING id").bind(sender).bind(recipient).bind(content).bind(action).bind(uuid).fetch_one(&mut *db).await?;
+    Ok(
+        sqlx::query("SELECT * FROM chat_messages WHERE private_message_id=$1")
+            .bind(private_id)
+            .fetch_one(db)
+            .await?,
+    )
+}
 async fn store_message(
     state: &AppState,
     user: &Account,
     id: i64,
     input: &ChatInput,
-) -> Result<Value, ApiError> {
+) -> Result<Value, ChatSendError> {
     let (content, uuid) = input.validate()?;
     if !user.can("chat.send") {
-        return Err(ApiError(StatusCode::FORBIDDEN, "chat_permission_required"));
+        return Err(ApiError(StatusCode::FORBIDDEN, "chat_permission_required").into());
     }
     common::rate_limit(state, format!("chat:{}", user.id), 30).await?;
     let row = access(state, user, id).await?;
@@ -464,46 +549,36 @@ async fn store_message(
         ];
     }
     let mut tx = state.pool.begin().await?;
+    sqlx::query("LOCK TABLE roles,user_roles IN SHARE MODE")
+        .execute(&mut *tx)
+        .await?;
     // All PM peers are locked in ID order, including concurrent opposite sends.
     sqlx::query("SELECT id FROM users WHERE id=ANY($1) ORDER BY id FOR UPDATE")
         .bind(ids)
         .execute(&mut *tx)
         .await?;
-    if !common::account(state, user.id).await?.can("chat.send") {
-        return Err(ApiError(StatusCode::FORBIDDEN, "chat_permission_required"));
+    let locked_user = common::account_in_tx(&mut tx, user.id).await?;
+    if !locked_user.can("chat.send") {
+        return Err(ApiError(StatusCode::FORBIDDEN, "chat_permission_required").into());
     }
-    access(state, user, id).await?;
-    if let Some(uuid) = uuid
-        && let Some(existing) =
-            sqlx::query("SELECT * FROM chat_messages WHERE user_id=$1 AND client_uuid=$2")
-                .bind(user.id)
-                .bind(uuid)
-                .fetch_optional(&mut *tx)
-                .await?
+    access(state, &locked_user, id).await?;
+    if let Some(existing) =
+        accepted_message(&mut tx, user.id, id, content, input.is_action, uuid).await?
     {
-        if existing.get::<i64, _>("channel_id") != id
-            || existing.get::<String, _>("content") != content
-            || existing.get::<bool, _>("is_action") != input.is_action
-        {
-            return Err(ApiError(StatusCode::CONFLICT, "message_uuid_conflict"));
-        }
-        return Ok(message_json(&existing));
+        return Ok(existing);
     }
     let stored = if private {
         let low: i64 = row.get("dm_user_low");
         let high: i64 = row.get("dm_user_high");
         let other = if low == user.id { high } else { low };
         pm_can_send(state, user.id, other).await?;
-        let private_id:i64=sqlx::query_scalar("INSERT INTO protocol_private_messages(sender_id,recipient_id,content,is_action,client_uuid) VALUES($1,$2,$3,$4,$5) RETURNING id").bind(user.id).bind(other).bind(content).bind(input.is_action).bind(uuid).fetch_one(&mut *tx).await?;
-        sqlx::query("SELECT * FROM chat_messages WHERE private_message_id=$1")
-            .bind(private_id)
-            .fetch_one(&mut *tx)
-            .await?
+        store_private(&mut tx, user.id, other, content, input.is_action, uuid).await?
     } else {
         let membership=sqlx::query("SELECT user_id FROM lazer_channel_members WHERE user_id=$1 AND channel_id=$2 FOR SHARE").bind(user.id).bind(id).fetch_optional(&mut *tx).await?;
         if membership.is_none() {
-            return Err(ApiError(StatusCode::FORBIDDEN, "join_channel_first"));
+            return Err(ApiError(StatusCode::FORBIDDEN, "join_channel_first").into());
         }
+        require_send_unsilenced(&mut tx, user.id).await?;
         sqlx::query("INSERT INTO chat_messages(channel_id,user_id,content,is_action,client_uuid) VALUES($1,$2,$3,$4,$5) RETURNING *").bind(id).bind(user.id).bind(content).bind(input.is_action).bind(uuid).fetch_one(&mut *tx).await?
     };
     tx.commit().await?;
@@ -514,7 +589,7 @@ async fn send_message(
     headers: HeaderMap,
     Path(id): Path<i64>,
     request: Request,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Json<Value>, ChatSendError> {
     let user = common::bearer(&state, &headers).await?;
     let input: ChatInput = crate::lazer::native_form(request).await?;
     Ok(Json(store_message(&state, &user, id, &input).await?))
@@ -526,18 +601,35 @@ struct Create {
     kind: String,
     target_id: i64,
 }
-async fn pm_channel(state: &AppState, user: &Account, target: i64) -> Result<i64, ApiError> {
+async fn pm_channel(
+    state: &AppState,
+    user: &Account,
+    target: i64,
+    message_bearing: bool,
+) -> Result<i64, ChatSendError> {
     if !user.can("chat.send") {
-        return Err(ApiError(StatusCode::FORBIDDEN, "chat_permission_required"));
+        return Err(ApiError(StatusCode::FORBIDDEN, "chat_permission_required").into());
     }
     pm_can_send(state, user.id, target).await?;
     common::rate_limit(state, format!("chat-create:{}", user.id), 30).await?;
     let mut tx = state.pool.begin().await?;
+    sqlx::query("LOCK TABLE roles,user_roles IN SHARE MODE")
+        .execute(&mut *tx)
+        .await?;
     sqlx::query("SELECT id FROM users WHERE id=ANY($1) ORDER BY id FOR UPDATE")
         .bind(vec![user.id, target])
         .execute(&mut *tx)
         .await?;
+    if !common::account_in_tx(&mut tx, user.id)
+        .await?
+        .can("chat.send")
+    {
+        return Err(ApiError(StatusCode::FORBIDDEN, "chat_permission_required").into());
+    }
     pm_can_send(state, user.id, target).await?;
+    if message_bearing {
+        require_send_unsilenced(&mut tx, user.id).await?;
+    }
     let id: i64 = sqlx::query_scalar("SELECT illya_pm_channel($1,$2)")
         .bind(user.id)
         .bind(target)
@@ -551,16 +643,13 @@ async fn create_channel(
     State(state): State<AppState>,
     headers: HeaderMap,
     request: Request,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Json<Value>, ChatSendError> {
     let user = common::bearer(&state, &headers).await?;
     let input: Create = crate::lazer::native_form(request).await?;
     if input.kind != "PM" {
-        return Err(ApiError(
-            StatusCode::NOT_IMPLEMENTED,
-            "channel_type_not_supported",
-        ));
+        return Err(ApiError(StatusCode::NOT_IMPLEMENTED, "channel_type_not_supported").into());
     }
-    let id = pm_channel(&state, &user, input.target_id).await?;
+    let id = pm_channel(&state, &user, input.target_id, false).await?;
     let row = access(&state, &user, id).await?;
     let mut channel = channel_json(&state, &user, &row).await?;
     // Native ChannelManager consumes this non-null APIChatChannel collection.
@@ -581,14 +670,25 @@ async fn new_conversation(
     State(state): State<AppState>,
     headers: HeaderMap,
     request: Request,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Json<Value>, ChatSendError> {
     let user = common::bearer(&state, &headers).await?;
-    let input: NewPm = crate::lazer::native_form(request).await?;
-    let id = pm_channel(&state, &user, input.target_id).await?;
+    let pm: NewPm = crate::lazer::native_form(request).await?;
+    let target = pm.target_id;
     let input = ChatInput {
-        message: input.message,
-        is_action: input.is_action,
-        uuid: input.uuid,
+        message: pm.message,
+        is_action: pm.is_action,
+        uuid: pm.uuid,
+    };
+    input.validate()?;
+    let existing_id: Option<i64> = sqlx::query_scalar("SELECT id FROM channels WHERE kind='PM' AND dm_user_low=LEAST($1,$2) AND dm_user_high=GREATEST($1,$2)")
+        .bind(user.id).bind(target).fetch_optional(&state.pool).await?;
+    let id = if let Some(id) = existing_id {
+        id
+    } else {
+        // Preliminary check only for the message-bearing route. Ordinary PM
+        // creation/join remains available for reading. The final store check
+        // is authoritative if policy changes between these two transactions.
+        pm_channel(&state, &user, target, true).await?
     };
     let message = store_message(&state, &user, id, &input).await?;
     let row = access(&state, &user, id).await?;
@@ -971,6 +1071,12 @@ async fn connection(
                 let Some(id)=event["id"].as_i64()else{break;};if seen.contains(&id){continue;}
                 if seen.len()>=1024{seen.clear();}seen.insert(id);
                     match deliver(&state,&user,id).await{Ok(Some(data))=>{if emit(&mut socket,"chat.message.new",data).await.is_err(){break;}},Ok(None)=>{},Err(_)=>break}
+                }else if event["kind"]=="chat_policy_changed"{
+                    // This ID-only event changes send policy, not membership.
+                    // Pinned ChannelManager has no supported policy update event;
+                    // its silences array would instead purge accepted history.
+                    // REST metadata is recalculated and every new send is fenced.
+                    continue;
                 }else if event["user"].as_i64()==Some(user.id){
                     let Some(id)=event["channel"].as_i64()else{break;};
                 let member=sqlx::query_scalar::<_,bool>("SELECT EXISTS(SELECT 1 FROM lazer_channel_members WHERE user_id=$1 AND channel_id=$2)").bind(user.id).bind(id).fetch_one(&state.pool).await;

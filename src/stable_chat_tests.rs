@@ -13,6 +13,9 @@ use sqlx::{
 use std::{collections::HashSet, net::SocketAddr, str::FromStr, sync::Arc, time::Duration};
 use tokio::{net::TcpListener, sync::oneshot, task::JoinHandle};
 
+#[path = "native_silence_stable_tests.rs"]
+mod timed_silence;
+
 struct Database {
     control: PgPool,
     pool: PgPool,

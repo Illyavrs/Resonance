@@ -7,7 +7,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use chrono::{Duration, Utc};
+use chrono::{DateTime, Duration, Utc};
 use illya_domain::ScoreVariant;
 use resonance_protocol::stable::{
     self as wire, ChatMessage, LoginRequest, Presence, Reader, UserAction, UserStats,
@@ -142,7 +142,8 @@ async fn login(state: &AppState, client: &str, body: &[u8]) -> Result<Response, 
     )?;
     // No administrative wire flags grant server permissions.
     append(&mut output, wire::int_packet(wire::server::PRIVILEGES, 5))?;
-    append(&mut output, wire::int_packet(wire::server::SILENCE_END, 0))?;
+    let silence = crate::native_chat::silence(&mut tx, player.id).await?;
+    append_silence(&mut output, silence, silence.is_some())?;
     append(
         &mut output,
         wire::friends_list(&common::friend_ids_in_tx(&mut tx, player.id).await?),
@@ -175,8 +176,8 @@ async fn login(state: &AppState, client: &str, body: &[u8]) -> Result<Response, 
     // The old sequence cursor remains a compatibility field only.
     let last_dm = 0_i64;
     let token = common::secret();
-    sqlx::query("INSERT INTO bancho_sessions(id,token_hash,user_id,expires_at,last_chat_id,last_dm_id,channels,utc_offset,block_non_friend_dms,action,client_version,client_hash_hash) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)")
-        .bind(uuid::Uuid::new_v4()).bind(common::token_hash(&token)).bind(player.id).bind(Utc::now()+Duration::seconds(180)).bind(last_chat).bind(last_dm).bind(&channel_ids).bind(i16::from(login.utc_offset)).bind(login.block_non_friend_dms).bind(json!(UserAction::default())).bind(&login.client_version).bind(common::token_hash(&login.client_hashes)).execute(&mut *tx).await?;
+    sqlx::query("INSERT INTO bancho_sessions(id,token_hash,user_id,expires_at,last_chat_id,last_dm_id,channels,utc_offset,block_non_friend_dms,action,client_version,client_hash_hash,last_chat_silence_until) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)")
+        .bind(uuid::Uuid::new_v4()).bind(common::token_hash(&token)).bind(player.id).bind(Utc::now()+Duration::seconds(180)).bind(last_chat).bind(last_dm).bind(&channel_ids).bind(i16::from(login.utc_offset)).bind(login.block_non_friend_dms).bind(json!(UserAction::default())).bind(&login.client_version).bind(common::token_hash(&login.client_hashes)).bind(silence.map(|value| value.until)).execute(&mut *tx).await?;
     tx.commit().await?;
     append_presence(&mut output, &player, login.utc_offset, 0)?;
     let self_stats = {
@@ -322,7 +323,7 @@ async fn poll(state: &AppState, token: &str, body: &[u8]) -> Result<Response, Ap
     } else {
         Vec::new()
     };
-    let session = sqlx::query("SELECT user_id,channels,last_chat_id,utc_offset,action,expires_at FROM bancho_sessions WHERE token_hash=$1 AND user_id=$2 FOR UPDATE").bind(&token_hash).bind(user_id).fetch_optional(&mut *tx).await?;
+    let session = sqlx::query("SELECT user_id,channels,last_chat_id,utc_offset,action,expires_at,last_chat_silence_until FROM bancho_sessions WHERE token_hash=$1 AND user_id=$2 FOR UPDATE").bind(&token_hash).bind(user_id).fetch_optional(&mut *tx).await?;
     let Some(session) = session else {
         return expired_session();
     };
@@ -339,6 +340,10 @@ async fn poll(state: &AppState, token: &str, body: &[u8]) -> Result<Response, Ap
     let mut channels: Vec<i64> = session.get("channels");
     let mut action: UserAction = serde_json::from_value(session.get("action")).unwrap_or_default();
     let mut output = Vec::new();
+    let mut last_silence: Option<DateTime<Utc>> = session.get("last_chat_silence_until");
+    let silence = crate::native_chat::silence(&mut tx, player.id).await?;
+    let mut send_notice =
+        sync_silence(&mut output, &mut last_silence, silence)? && silence.is_some();
     for packet in packets {
         if crate::multiplayer::handle(
             state,
@@ -451,6 +456,19 @@ async fn poll(state: &AppState, token: &str, body: &[u8]) -> Result<Response, Ap
                 let message = ChatMessage::decode(packet.payload)?;
                 if !player.can("chat.send") {
                     return Err(ApiError(StatusCode::FORBIDDEN, "chat_permission_required"));
+                }
+                // This gate precedes both special channels and ordinary PMs.
+                // A refused send must not discard other packets or incoming PMs.
+                let silence = crate::native_chat::silence(&mut tx, player.id).await?;
+                if sync_silence(&mut output, &mut last_silence, silence)? && silence.is_some() {
+                    send_notice = true;
+                }
+                if let Some(silence) = silence {
+                    if !send_notice {
+                        append_silence(&mut output, Some(silence), true)?;
+                        send_notice = true;
+                    }
+                    continue;
                 }
                 let text = message.text.trim();
                 let (content, is_action) = if let Some(action) = text
@@ -628,8 +646,11 @@ async fn poll(state: &AppState, token: &str, body: &[u8]) -> Result<Response, Ap
         .await?;
     // Use the unchanged locked deadline after all resource waits. An expired
     // request cannot consume pending PMs or resurrect its own session.
-    let refreshed = sqlx::query("UPDATE bancho_sessions SET expires_at=$2,last_chat_id=$3,channels=$4,action=$5 WHERE token_hash=$1 AND expires_at=$6 AND expires_at>clock_timestamp()")
-        .bind(&token_hash).bind(Utc::now()+Duration::seconds(180)).bind(last_chat).bind(channels).bind(json!(action)).bind(deadline).execute(&mut *tx).await?;
+    // A long poll may cross natural expiry while waiting for another resource.
+    let silence = crate::native_chat::silence(&mut tx, player.id).await?;
+    sync_silence(&mut output, &mut last_silence, silence)?;
+    let refreshed = sqlx::query("UPDATE bancho_sessions SET expires_at=$2,last_chat_id=$3,channels=$4,action=$5,last_chat_silence_until=$7 WHERE token_hash=$1 AND expires_at=$6 AND expires_at>clock_timestamp()")
+        .bind(&token_hash).bind(Utc::now()+Duration::seconds(180)).bind(last_chat).bind(channels).bind(json!(action)).bind(deadline).bind(last_silence).execute(&mut *tx).await?;
     if refreshed.rows_affected() != 1 {
         return expired_session();
     }
@@ -647,6 +668,102 @@ fn expired_session() -> Result<Response, ApiError> {
         ),
     )?;
     Ok(binary(output, None))
+}
+
+fn append_silence(
+    output: &mut Vec<u8>,
+    silence: Option<crate::native_chat::Silence>,
+    notify: bool,
+) -> Result<(), ApiError> {
+    append(
+        output,
+        wire::int_packet(
+            wire::server::SILENCE_END,
+            silence.map_or(0, |value| value.remaining_seconds),
+        ),
+    )?;
+    if notify {
+        let message = silence.map_or_else(
+            || "Your chat silence has ended. You can send messages again.".to_owned(),
+            |value| {
+                format!(
+                    "Chat is silenced for {} more seconds. You can still read messages and play.",
+                    value.remaining_seconds
+                )
+            },
+        );
+        append(
+            output,
+            wire::string_packet(wire::server::NOTIFICATION, &message),
+        )?;
+    }
+    Ok(())
+}
+
+fn sync_silence(
+    output: &mut Vec<u8>,
+    previous: &mut Option<DateTime<Utc>>,
+    current: Option<crate::native_chat::Silence>,
+) -> Result<bool, ApiError> {
+    let until = current.map(|value| value.until);
+    if *previous != until {
+        append_silence(output, current, true)?;
+        *previous = until;
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+#[cfg(test)]
+mod timed_silence_wire {
+    use super::*;
+
+    #[test]
+    fn notices_only_announce_policy_transitions_and_use_remaining_seconds() {
+        let until = DateTime::parse_from_rfc3339("2026-10-09T18:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let current = crate::native_chat::Silence {
+            until,
+            remaining_seconds: 37,
+        };
+        let mut previous = None;
+        let mut bytes = Vec::new();
+        assert!(sync_silence(&mut bytes, &mut previous, Some(current)).unwrap());
+        let unchanged = bytes.len();
+        assert!(
+            !sync_silence(
+                &mut bytes,
+                &mut previous,
+                Some(crate::native_chat::Silence {
+                    remaining_seconds: 36,
+                    ..current
+                })
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            bytes.len(),
+            unchanged,
+            "countdown changes are not policy changes"
+        );
+        assert!(sync_silence(&mut bytes, &mut previous, None).unwrap());
+        assert!(!sync_silence(&mut bytes, &mut previous, None).unwrap());
+        let packets = wire::decode_packets(&bytes).unwrap();
+        let durations: Vec<_> = packets
+            .iter()
+            .filter(|packet| packet.id == wire::server::SILENCE_END)
+            .map(|packet| i32::from_le_bytes(packet.payload.try_into().unwrap()))
+            .collect();
+        assert_eq!(durations, vec![37, 0]);
+        assert_eq!(
+            packets
+                .iter()
+                .filter(|packet| packet.id == wire::server::NOTIFICATION)
+                .count(),
+            2
+        );
+    }
 }
 
 /// The poll has already locked the actor and every friend target in ID order,

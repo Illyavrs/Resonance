@@ -30,8 +30,10 @@ pub fn router() -> Router<AppState> {
     Router::new()
         .route("/oauth/token", post(oauth))
         .route("/api/v2/me", get(me))
+        .route("/api/v2/me/", get(me))
         .route("/api/v2/me/{ruleset}", get(me_mode))
         .route("/api/v2/users/{id}", get(user))
+        .route("/api/v2/users/{id}/", get(user))
         .route("/api/v2/users/{id}/{ruleset}", get(user_mode))
         .route("/api/v2/users/{id}/scores/{kind}", get(user_scores))
         .route("/api/v2/rankings/{ruleset}/performance", get(rankings))
@@ -805,6 +807,10 @@ async fn news() -> Json<Value> {
 #[cfg(test)]
 #[path = "lazer_refresh_tests.rs"]
 mod refresh_tests;
+
+#[cfg(test)]
+#[path = "lazer_alias_tests.rs"]
+mod alias_tests;
 
 #[cfg(test)]
 mod tests {
