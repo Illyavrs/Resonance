@@ -58,6 +58,7 @@ const DIFFERENT_FRAMES: &[u8] = &[
 struct Backend {
     pool: PgPool,
     status: Arc<AtomicU16>,
+    ingestion_status: Arc<AtomicU16>,
     invalid: Arc<AtomicU8>,
     winner_judgements: Arc<AtomicU8>,
     calls: Arc<Mutex<Vec<Value>>>,
@@ -104,6 +105,13 @@ async fn ingest(
     assert_eq!(headers["x-illya-service-key"], SERVICE_KEY);
     assert_eq!(input["client"], "stable");
     state.ingested.lock().await.push(input.clone());
+    let status = StatusCode::from_u16(state.ingestion_status.load(Ordering::SeqCst)).unwrap();
+    if status != StatusCode::OK {
+        return (
+            status,
+            Json(json!({"error":{"code":"original_ingestion_fixture_error"}})),
+        );
+    }
     let existing: bool =
         sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM scores WHERE ingestion_key=$1)")
             .bind(input["ingestion_key"].as_str().unwrap())
@@ -203,6 +211,7 @@ impl Fixture {
         let backend = Backend {
             pool: pool.clone(),
             status: Arc::new(AtomicU16::new(200)),
+            ingestion_status: Arc::new(AtomicU16::new(200)),
             invalid: Arc::new(AtomicU8::new(0)),
             winner_judgements: Arc::new(AtomicU8::new(0)),
             calls: Default::default(),
@@ -363,6 +372,220 @@ fn native_map_encrypted_fixture_has_valid_checksum() {
         resonance_protocol::submission::validate_compressed_frames(DIFFERENT_FRAMES).unwrap(),
         3
     );
+}
+
+#[tokio::test]
+#[ignore = "requires ILLYA_TEST_DATABASE_URL; creates and removes isolated schemas"]
+async fn stable_ingestion_outage_retries_keep_one_receipt_replay_and_publication() {
+    let f = Fixture::new().await;
+    let result = std::panic::AssertUnwindSafe(async {
+        f.backend.ingestion_status.store(503, Ordering::SeqCst);
+        let unavailable = f.submit(ENVELOPE).await;
+        assert_eq!(unavailable.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            unavailable.json::<Value>().await.unwrap()["error"],
+            "score_ingestion_unavailable"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM scores")
+                .fetch_one(&f.state.pool)
+                .await
+                .unwrap(),
+            0
+        );
+        assert!(
+            tokio::fs::read_dir(f.storage.join("replays"))
+                .await
+                .unwrap()
+                .next_entry()
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        f.backend.ingestion_status.store(400, Ordering::SeqCst);
+        let rejected = f.submit(ENVELOPE).await;
+        assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            rejected.json::<Value>().await.unwrap()["error"],
+            "score_rejected_by_ingestion"
+        );
+
+        f.backend.ingestion_status.store(200, Ordering::SeqCst);
+        let accepted = f.submit(ENVELOPE).await;
+        assert_eq!(accepted.status(), StatusCode::OK);
+        let row = sqlx::query("SELECT id,ingestion_key,replay_path FROM scores")
+            .fetch_one(&f.state.pool)
+            .await
+            .unwrap();
+        let id: i64 = row.get("id");
+        let key: String = row.get("ingestion_key");
+        let path: String = row.get("replay_path");
+        assert!(
+            accepted
+                .text()
+                .await
+                .unwrap()
+                .contains(&format!("onlineScoreId:{id}|"))
+        );
+        let original_file = tokio::fs::read(f.storage.join("replays").join(&path))
+            .await
+            .unwrap();
+
+        // A backend outage during an exact retained retry must leave the saved
+        // receipt and replay untouched, and recovery must reuse their identity.
+        f.backend.ingestion_status.store(503, Ordering::SeqCst);
+        assert_eq!(
+            f.submit(ENVELOPE).await.status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        f.backend.ingestion_status.store(200, Ordering::SeqCst);
+        let retried = f.submit(ENVELOPE).await;
+        assert_eq!(retried.status(), StatusCode::OK);
+        assert!(
+            retried
+                .text()
+                .await
+                .unwrap()
+                .contains(&format!("onlineScoreId:{id}|"))
+        );
+        let retained = sqlx::query("SELECT id,replay_path FROM scores")
+            .fetch_one(&f.state.pool)
+            .await
+            .unwrap();
+        assert_eq!(retained.get::<i64, _>("id"), id);
+        assert_eq!(retained.get::<String, _>("replay_path"), path);
+        assert_eq!(
+            tokio::fs::read(f.storage.join("replays").join(&path))
+                .await
+                .unwrap(),
+            original_file
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM scores")
+                .fetch_one(&f.state.pool)
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM audit_events WHERE action='scores.stable_ingest'"
+            )
+            .fetch_one(&f.state.pool)
+            .await
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM audit_events WHERE action='scores.native_publish'"
+            )
+            .fetch_one(&f.state.pool)
+            .await
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM bancho_packet_queue")
+                .fetch_one(&f.state.pool)
+                .await
+                .unwrap(),
+            1
+        );
+        let requests = f.backend.ingested.lock().await;
+        assert_eq!(requests.len(), 5);
+        assert!(requests.iter().all(|input| input["ingestion_key"] == key));
+    })
+    .catch_unwind()
+    .await;
+    f.cleanup().await;
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires ILLYA_TEST_DATABASE_URL; creates and removes isolated schemas"]
+async fn stable_oversized_replay_is_rejected_before_discovery_and_ingestion() {
+    let f = Fixture::new().await;
+    let result = std::panic::AssertUnwindSafe(async {
+        let frames =
+            vec![0x81; resonance_protocol::submission::MAX_STABLE_COMPRESSED_REPLAY_BYTES + 1];
+        let response = f.submit_frames(ENVELOPE, &frames).await;
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(
+            response.json::<Value>().await.unwrap()["error"],
+            "score_upload_too_large"
+        );
+        assert!(f.backend.calls.lock().await.is_empty());
+        assert!(f.backend.ingested.lock().await.is_empty());
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM scores")
+                .fetch_one(&f.state.pool)
+                .await
+                .unwrap(),
+            0
+        );
+        assert!(
+            tokio::fs::read_dir(f.storage.join("replays"))
+                .await
+                .unwrap()
+                .next_entry()
+                .await
+                .unwrap()
+                .is_none()
+        );
+    })
+    .catch_unwind()
+    .await;
+    f.cleanup().await;
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires ILLYA_TEST_DATABASE_URL; creates and removes isolated schemas"]
+async fn stable_capacity_container_roundtrips_owned_storage_and_download_routes() {
+    let f = Fixture::new().await;
+    let result = std::panic::AssertUnwindSafe(async {
+        assert_eq!(f.submit(ENVELOPE).await.status(), StatusCode::OK);
+        let row = sqlx::query("SELECT id,replay_path FROM scores").fetch_one(&f.state.pool).await.unwrap();
+        let id: i64 = row.get("id");
+        let path: String = row.get("replay_path");
+        let submission = StableSubmission::parse(&decrypt_score_field(ENVELOPE, IV, "20261007").unwrap()).unwrap();
+        // These are deliberately opaque synthetic bytes, not valid LZMA. This
+        // proves the capacity of storage/read/download paths. The small valid
+        // FRAMES fixtures separately prove complete passed-score HTTP retries.
+        let frames = vec![0x81; resonance_protocol::submission::MAX_STABLE_COMPRESSED_REPLAY_BYTES];
+        let container = submission.replay_container(20261007, &frames, id).unwrap();
+        assert!(container.len() <= resonance_protocol::replay::MAX_REPLAY_BYTES);
+        tokio::fs::write(f.storage.join("replays").join(&path), &container).await.unwrap();
+        let stored = common::stored_file(&f.state, &path, "replays", resonance_protocol::replay::MAX_REPLAY_BYTES as u64).await.unwrap();
+        assert_eq!(stored, container);
+        let parsed = resonance_protocol::replay::LegacyReplay::parse(&stored).unwrap();
+        assert_eq!(parsed.compressed_frames, frames);
+        assert_eq!(parsed.online_score_id, Some(id));
+
+        let mut auth = f.auth();
+        auth.extend([("c", id.to_string()), ("m", "0".into())]);
+        let stable = f.state.http.get(format!("{}/web/osu-getreplay.php", f.base)).query(&auth).send().await.unwrap();
+        assert_eq!(stable.status(), StatusCode::OK);
+        assert_eq!(stable.bytes().await.unwrap().as_ref(), frames);
+
+        let bearer = common::secret();
+        sqlx::query("INSERT INTO lazer_sessions(id,user_id,access_hash,refresh_hash,access_expires_at,refresh_expires_at) VALUES($1,$2,$3,$4,now()+interval '1 hour',now()+interval '1 day')")
+            .bind(uuid::Uuid::new_v4()).bind(f.user).bind(common::token_hash(&bearer)).bind(common::secret()).execute(&f.state.pool).await.unwrap();
+        let exported = f.state.http.get(format!("{}/api/v2/scores/{id}/download", f.base)).bearer_auth(&bearer).send().await.unwrap();
+        assert_eq!(exported.status(), StatusCode::OK);
+        assert_eq!(exported.bytes().await.unwrap().as_ref(), container);
+        assert_eq!(sqlx::query_scalar::<_, i64>("SELECT count(*) FROM scores").fetch_one(&f.state.pool).await.unwrap(), 1);
+    }).catch_unwind().await;
+    f.cleanup().await;
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
 }
 
 #[tokio::test]

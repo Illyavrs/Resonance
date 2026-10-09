@@ -24,7 +24,7 @@ use tower::ServiceExt;
 
 const BOUNDARY: &str = "illyaverse-stable-upload-fixture";
 const SCALAR_BYTES: usize = 32 * 1024;
-const REPLAY_BYTES: usize = 16 * 1024 * 1024;
+const REPLAY_BYTES: usize = resonance_protocol::submission::MAX_STABLE_COMPRESSED_REPLAY_BYTES;
 const TOTAL_BYTES: usize = 20 * 1024 * 1024;
 const FRAMEWORK_BODY_LIMIT: usize = 512;
 
@@ -724,6 +724,10 @@ fn total_limit_parts(over: bool) -> Vec<Part> {
             &format!("parameter_{index}"),
             vec![b'p'; SCALAR_BYTES],
         ));
+    }
+    let remainder = (TOTAL_BYTES - REPLAY_BYTES) % SCALAR_BYTES;
+    if remainder != 0 {
+        parts.push(Part::text("parameter_remainder", vec![b'p'; remainder]));
     }
     if over {
         parts.push(Part::text("over_total", vec![b'p']));

@@ -7,7 +7,10 @@ use axum::{
 use chrono::Utc;
 use resonance_protocol::{
     ProtocolError, stable as wire,
-    submission::{StableSubmission, decrypt_score_field, validate_compressed_frames},
+    submission::{
+        MAX_STABLE_COMPRESSED_REPLAY_BYTES, StableSubmission, decrypt_score_field,
+        validate_compressed_frames,
+    },
 };
 use serde_json::{Value, json};
 use sqlx::{Row, postgres::PgRow};
@@ -16,6 +19,10 @@ use std::collections::HashMap;
 #[cfg(test)]
 #[path = "stable_upload_tests.rs"]
 mod upload_tests;
+
+#[cfg(test)]
+#[path = "stable_resilience_tests.rs"]
+mod resilience_tests;
 
 const MAX_SCORE_PARAMETER_BYTES: usize = 32_768;
 const MAX_SCORE_UPLOAD_BYTES: usize = 20_971_520;
@@ -335,7 +342,7 @@ async fn read_score_upload(mut multipart: Multipart) -> Result<ScoreUpload, ApiE
         let parsed_filename_present = field.file_name().is_some();
         let mut bytes = Vec::new();
         let limit = if parsed_name == "score" && parsed_filename_present {
-            resonance_protocol::replay::MAX_REPLAY_BYTES
+            MAX_STABLE_COMPRESSED_REPLAY_BYTES
         } else {
             MAX_SCORE_PARAMETER_BYTES
         };
@@ -388,7 +395,7 @@ async fn read_score_upload(mut multipart: Multipart) -> Result<ScoreUpload, ApiE
         let limit = if discard_extension {
             MAX_SCORE_UPLOAD_BYTES
         } else if name == "score" && is_file {
-            resonance_protocol::replay::MAX_REPLAY_BYTES
+            MAX_STABLE_COMPRESSED_REPLAY_BYTES
         } else {
             MAX_SCORE_PARAMETER_BYTES
         };
@@ -633,6 +640,53 @@ fn parse_score_submission(decoded: &str) -> Result<StableSubmission, ApiError> {
     })
 }
 
+fn preflight_replay_container(
+    submission: &StableSubmission,
+    version: &str,
+    replay: &[u8],
+) -> Result<Option<Vec<u8>>, ApiError> {
+    if !submission.passed {
+        return Ok(None);
+    }
+    let version = version
+        .parse()
+        .map_err(|_| ApiError(StatusCode::BAD_REQUEST, "invalid_score_version"))?;
+    // The receipt ID is a fixed-width tail. Prepare all fallible serialization
+    // before ingestion can persist a score, then replace just that tail later.
+    let container =
+        submission
+            .replay_container(version, replay, 0)
+            .map_err(|error| match error {
+                ProtocolError::Limit("replay frames" | "replay size") => {
+                    ApiError(StatusCode::PAYLOAD_TOO_LARGE, "score_upload_too_large")
+                }
+                _ => ApiError(StatusCode::BAD_REQUEST, "invalid_score_replay"),
+            })?;
+    resonance_protocol::replay::LegacyReplay::parse(&container)
+        .map_err(|_| ApiError(StatusCode::BAD_REQUEST, "invalid_score_replay"))?;
+    Ok(Some(container))
+}
+
+fn score_ingestion_rejection(status: StatusCode) -> ApiError {
+    if status == StatusCode::GONE {
+        ApiError(StatusCode::GONE, "beatmap_withdrawn")
+    } else if status == StatusCode::CONFLICT {
+        duplicate_payload()
+    } else if status.is_server_error()
+        || matches!(
+            status,
+            StatusCode::REQUEST_TIMEOUT | StatusCode::TOO_MANY_REQUESTS
+        )
+    {
+        ApiError(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "score_ingestion_unavailable",
+        )
+    } else {
+        ApiError(StatusCode::BAD_REQUEST, "score_rejected_by_ingestion")
+    }
+}
+
 #[derive(Default)]
 struct ChartStats {
     rank: i64,
@@ -814,6 +868,8 @@ async fn submit_inner(state: AppState, multipart: Multipart) -> Result<Response,
     }
     let variant = illya_domain::ScoreVariant::from_legacy(submission.mode, submission.mods)
         .map_err(|_| ApiError(StatusCode::BAD_REQUEST, "invalid_score_variant"))?;
+    let replay = replay.unwrap_or_default();
+    let preflighted_replay = preflight_replay_container(&submission, version, &replay)?;
     let ingestion_key = format!("stable:{}:{}", player.id, submission.checksum);
     // A persisted score owns its immutable identity even when the set is later
     // withdrawn. Only exact existing receipts bypass active discovery.
@@ -867,7 +923,6 @@ async fn submit_inner(state: AppState, multipart: Multipart) -> Result<Response,
             "internal_ingestion_not_configured",
         ));
     }
-    let replay = replay.unwrap_or_default();
     let frame_count = if submission.passed {
         let compressed = replay.clone();
         tokio::task::spawn_blocking(move || validate_compressed_frames(&compressed))
@@ -885,16 +940,7 @@ async fn submit_inner(state: AppState, multipart: Multipart) -> Result<Response,
     let [n300, n100, n50, geki, katu, misses] = submission.hit_counts;
     let response=state.http.post(format!("{}/api/v1/internal/scores",state.sanctuary_url.trim_end_matches('/'))).header("x-illya-service-key",state.service_key.as_str()).json(&json!({"user_id":player.id,"beatmap_id":map_id,"mode":submission.mode,"score":submission.total_score,"accuracy":0,"max_combo":submission.max_combo,"mods":submission.mods,"passed":submission.passed,"hit_counts":{"n300":n300,"n100":n100,"n50":n50,"geki":geki,"katu":katu,"misses":misses},"client":"stable","ingestion_key":format!("stable:{}:{}",player.id,submission.checksum)})).send().await.map_err(|_|ApiError(StatusCode::SERVICE_UNAVAILABLE,"score_ingestion_unavailable"))?;
     if !response.status().is_success() {
-        if response.status() == StatusCode::GONE {
-            return Err(ApiError(StatusCode::GONE, "beatmap_withdrawn"));
-        }
-        if response.status() == StatusCode::CONFLICT {
-            return Err(duplicate_payload());
-        }
-        return Err(ApiError(
-            StatusCode::BAD_REQUEST,
-            "score_rejected_by_ingestion",
-        ));
+        return Err(score_ingestion_rejection(response.status()));
     }
     let result: Value = response
         .json()
@@ -936,17 +982,18 @@ async fn submit_inner(state: AppState, multipart: Multipart) -> Result<Response,
         submission.mods,
     )
     .await?;
-    if submission.passed {
-        let container = submission.replay_container(
-            version
-                .parse()
-                .map_err(|_| ApiError(StatusCode::BAD_REQUEST, "invalid_score_version"))?,
-            &replay,
-            score_id,
-        )?;
+    if let Some(mut container) = preflighted_replay {
+        let online_id_offset = container.len() - 8;
+        container[online_id_offset..].copy_from_slice(&score_id.to_le_bytes());
         let expected = resonance_protocol::replay::LegacyReplay::parse(&container)?;
         if let Some(path) = row.get::<Option<String>, _>("replay_path") {
-            let existing = common::stored_file(&state, &path, "replays", 16_777_216).await?;
+            let existing = common::stored_file(
+                &state,
+                &path,
+                "replays",
+                resonance_protocol::replay::MAX_REPLAY_BYTES as u64,
+            )
+            .await?;
             let existing = resonance_protocol::replay::LegacyReplay::parse(&existing)?;
             if existing.compressed_frames != replay {
                 return Err(ApiError(
