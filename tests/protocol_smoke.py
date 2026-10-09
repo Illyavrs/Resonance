@@ -105,6 +105,45 @@ def score_state(score):
     return {key: score[key] for key in keys if key in score}
 
 
+def score_review_state(admin, score_id):
+    """Use the persisted fixture revision; absent or invalid CAS state is fatal."""
+    score = admin.json("GET", f"/api/v1/scores/{score_id}")
+    revision = score["moderation_revision"]
+    assert score["id"] == score_id, score_state(score)
+    assert type(revision) is int and revision >= 0, (score_id, "invalid moderation revision")
+    assert score["verification"] in ("pending", "verified", "rejected"), score_state(score)
+    return {key: score[key] for key in ("id", "verification", "moderation_revision")}
+
+
+def review_score(admin, score_id, verification, *, from_status):
+    """One deliberate transition with one observed revision; never retry CAS."""
+    current = score_review_state(admin, score_id)
+    assert current["verification"] == from_status, current
+    assert verification != from_status, (score_id, "review fixture must change status")
+    reviewed = admin.json("PATCH", f"/api/v1/admin/scores/{score_id}", {
+        "verification": verification,
+        "expected_revision": current["moderation_revision"],
+    })
+    assert reviewed["ok"] is True and reviewed["id"] == score_id, reviewed
+    assert reviewed["verification"] == verification, reviewed
+    assert type(reviewed["moderation_revision"]) is int, reviewed
+    assert reviewed["moderation_revision"] == current["moderation_revision"] + 1, reviewed
+    return reviewed
+
+
+def reject_score_review(admin, score_id, verification, revision, *, status, code):
+    """Rejected/no-op decisions cannot change the resource or create an audit."""
+    before = score_review_state(admin, score_id)
+    audit_before = admin.json("GET", "/api/v1/admin/audit")
+    rejected = admin.json("PATCH", f"/api/v1/admin/scores/{score_id}", {
+        "verification": verification,
+        "expected_revision": revision,
+    }, expected=status)
+    assert rejected["error"]["code"] == code, rejected
+    assert score_review_state(admin, score_id) == before
+    assert admin.json("GET", "/api/v1/admin/audit") == audit_before
+
+
 def wire_string(text):
     raw = text.encode()
     size = len(raw)
@@ -449,7 +488,7 @@ def native_room_smoke(admin, gateway, bearer, player_id, map_id, map_hash, objec
         assert global_completed["replay_complete"] is True, score_state(global_completed)
         # Frozen-room peer privacy below is an explicit moderation fixture,
         # rather than the normal native submission policy.
-        admin.json("PATCH", f"/api/v1/admin/scores/{host_nm['id']}", {"verification": "pending"})
+        review_score(admin, host_nm["id"], "pending", from_status="verified")
         assert gateway.json("PUT", first + f"/{host_token}", nm_input, bearer)["id"] == host_nm["id"]
         assert admin.json("GET", f"/api/v1/scores/{host_nm['id']}")["verification"] == "pending"
         gateway.request("PUT", first + f"/{host_token}", dict(nm_input, total_score=999999), bearer, expected=409)
@@ -794,7 +833,7 @@ def run():
         assert gateway.json("PUT", path, score, bearer)["verification"] == "verified"
         # Keep the mixed-client ranking fixture pending until its explicit
         # moderation step below, and prove a native retry cannot undo that choice.
-        admin.json("PATCH", f"/api/v1/admin/scores/{lazer['id']}", {"verification": "pending"})
+        review_score(admin, lazer["id"], "pending", from_status="verified")
     assert lazer["score_variant"] == "vanilla", "Untrusted variant overrode native mods"
     lazer_retry = gateway.json("PUT", path, score, bearer)
     assert lazer_retry["id"] == lazer["id"], score_state(lazer_retry)
@@ -911,11 +950,28 @@ def run():
     leaderboard_query = urllib.parse.urlencode({"u": player_name, "h": digest(player_password), "c": map_hash, "m": 0})
     score_line = re.compile(rf"^{stable_id}\|{re.escape(player_name)}\|", re.MULTILINE)
     assert score_line.search(gateway.request("GET", "/web/osu-osz2-getscores.php?" + leaderboard_query)[0].decode()), "Validated native score was not immediately ranked"
-    for review_state in ("pending", "rejected", "pending"):
-        admin.json("PATCH", f"/api/v1/admin/scores/{stable_id}", {"verification": review_state})
+    original_review = score_review_state(admin, stable_id)
+    reject_score_review(admin, stable_id, "verified", original_review["moderation_revision"],
+                        status=400, code="score_verification_unchanged")
+    first_pending_revision = None
+    for from_status, review_state in (("verified", "pending"), ("pending", "rejected"), ("rejected", "pending")):
+        reviewed = review_score(admin, stable_id, review_state, from_status=from_status)
+        if first_pending_revision is None:
+            first_pending_revision = reviewed["moderation_revision"]
         assert f"onlineScoreId:{stable_id}|" in gateway.request("POST", "/web/osu-submit-modular-selector.php", body, headers)[0].decode()
         assert admin.json("GET", f"/api/v1/scores/{stable_id}")["verification"] == review_state, "Native retry overrode an explicit moderation decision"
         anonymous.request("GET", f"/api/v1/scores/{stable_id}", expected=404)
+    # Status returned to pending, but its earlier pending revision is obsolete.
+    # Do not refresh/retry this stale reviewer automatically.
+    current_review = score_review_state(admin, stable_id)
+    assert current_review["verification"] == "pending"
+    assert current_review["moderation_revision"] == first_pending_revision + 2
+    reject_score_review(admin, stable_id, "verified", first_pending_revision,
+                        status=409, code="score_moderation_conflict")
+    reject_score_review(admin, stable_id, "pending", original_review["moderation_revision"],
+                        status=409, code="score_moderation_conflict")
+    reject_score_review(admin, stable_id, "pending", current_review["moderation_revision"],
+                        status=400, code="score_verification_unchanged")
     review_retry_events = packets(gateway.request("POST", "/", packet(4), player_bancho)[0])
     assert not any(kind in (11, 24) for kind, _ in review_retry_events)
     pending_board = gateway.request("GET", "/web/osu-osz2-getscores.php?" + leaderboard_query)[0].decode()
@@ -923,7 +979,7 @@ def run():
     assert not score_line.search(pending_board), "Pending score leaked to ranking"
     pending_statistics_after = gateway.json("GET", "/api/v2/me/osu", headers=bearer)["statistics"]
     assert all(pending_statistics_after[key] == pending_statistics_before[key] for key in ("ranked_score", "pp")), "Pending submissions changed ranked totals"
-    admin.json("PATCH", f"/api/v1/admin/scores/{stable_id}", {"verification": "verified"})
+    review_score(admin, stable_id, "verified", from_status="pending")
     assert score_line.search(gateway.request("GET", "/web/osu-osz2-getscores.php?" + leaderboard_query)[0].decode())
     native_scores = gateway.json("GET", f"/api/v2/beatmaps/{map_id}/scores?mode=osu&type=global", headers=bearer)
     assert native_scores["score_count"] == 1 and native_scores["scores"][0]["id"] == stable_id
@@ -969,7 +1025,7 @@ def run():
     assert not any(kind in (11, 24) for kind, _ in packets(gateway.request("POST", "/", packet(4), player_bancho)[0]))
     # Keep the existing exact mixed-scale totals isolated after testing failure
     # publication; the explicit rejection remains authoritative on retry.
-    admin.json("PATCH", f"/api/v1/admin/scores/{failed_id}", {"verification": "rejected"})
+    review_score(admin, failed_id, "rejected", from_status="verified")
     assert gateway.request("POST", "/web/osu-submit-modular-selector.php", failed_body, failed_headers)[0] == b"error: no"
     assert admin.json("GET", f"/api/v1/scores/{failed_id}")["verification"] == "rejected"
 
@@ -986,7 +1042,7 @@ def run():
     player_site.request("POST", "/api/v1/scores", dict(api_payload, client="stable"), expected=400)
     assert gateway.json("GET", "/api/v2/me/osu", headers=bearer)["statistics"] == before_failure
 
-    admin.json("PATCH", f"/api/v1/admin/scores/{lazer['id']}", {"verification": "verified"})
+    review_score(admin, lazer["id"], "verified", from_status="pending")
     native_scores = gateway.json("GET", f"/api/v2/beatmaps/{map_id}/scores?mode=osu&type=global", headers=bearer)
     assert native_scores["score_count"] == 1 and native_scores["scores"][0]["id"] == lazer["id"]
     assert native_scores["user_score"]["position"] == 1
@@ -1041,7 +1097,9 @@ def run():
     nm_token = gateway.json("POST", f"/api/v2/beatmaps/{map_id}/solo/scores", nm_token_fields, dict(bearer, **{"Content-Type": "application/x-www-form-urlencoded"}))["id"]
     nm_baseline = gateway.json("PUT", f"/api/v2/beatmaps/{map_id}/solo/scores/{nm_token}", dict(score, max_combo=rx_count, statistics={"great": rx_count}, maximum_statistics={"great": rx_count}), bearer)
     assert nm_baseline["score_variant"] == "vanilla"
-    admin.json("PATCH", f"/api/v1/admin/scores/{nm_baseline['id']}", {"verification": "verified"})
+    # This fixture has no completed native replay capture; publish it through a
+    # deliberate staff transition rather than assuming native publication.
+    review_score(admin, nm_baseline["id"], "verified", from_status="pending")
     vanilla_stats = gateway.json("GET", "/api/v2/me/osu", headers=bearer)["statistics"]
     vanilla_site_stats = admin.json("GET", f"/api/v1/users/{player_id}?mode=0")["statistics"]
     admin_oauth = gateway.json("POST", "/oauth/token", {"grant_type": "password", "username": admin_name, "password": admin_password})
@@ -1113,7 +1171,7 @@ def run():
     # Preserve the explicit moderation/privacy coverage with staff decisions;
     # normal native RX has already been accepted automatically above.
     for score_id in (rx_weak_id, rx_stable_id):
-        admin.json("PATCH", f"/api/v1/admin/scores/{score_id}", {"verification": "pending"})
+        review_score(admin, score_id, "pending", from_status="verified")
     assert encrypted_rx() == rx_stable_id
     assert admin.json("GET", f"/api/v1/scores/{rx_stable_id}")["verification"] == "pending"
 
@@ -1135,7 +1193,7 @@ def run():
     gateway.request("GET", "/web/osu-getreplay.php?" + rx_replay_query.replace("m=0", "m=1"), expected=404)
 
     for score_id in rx_all_ids:
-        admin.json("PATCH", f"/api/v1/admin/scores/{score_id}", {"verification": "verified"})
+        review_score(admin, score_id, "verified", from_status="pending")
     rx_board = gateway.request("GET", "/web/osu-osz2-getscores.php?" + rx_query)[0].decode()
     assert rx_line.search(rx_board) and not re.search(rf"^{rx_weak_id}\|", rx_board, re.MULTILINE)
     assert not score_line.search(rx_board) and not v2_line.search(rx_board)
@@ -1192,7 +1250,7 @@ def run():
                 assert stored["verification"] == "verified", score_state(stored)
             else:
                 assert stored["verification"] == "pending", score_state(stored)
-                admin.json("PATCH", f"/api/v1/admin/scores/{stored['id']}", {"verification": "verified"})
+                review_score(admin, stored["id"], "verified", from_status="pending")
         converted_stats = admin.json("GET", f"/api/v1/users/{player_id}?mode={mode}&variant=relax")["statistics"]
         assert converted_stats["play_count"] == 2 and abs(converted_stats["pp"] - max(item["pp"] for item in converted_records)) < 1e-9
         assert gateway.json("GET", f"/api/v2/me/{native_mode}?variant=relax", headers=bearer)["statistics"]["play_count"] == 2
@@ -1509,6 +1567,8 @@ def run():
                    "explicit pending/rejected staff decisions survive native retries",
                    "in-progress lazer replay remains private; complete solo/room capture publishes automatically",
                    "generic website API scores remain pending and cannot select native authority"])
+    checks.extend(["score moderation uses the fetched revision and explicit status transitions without CAS retry",
+                   "score moderation rejects unchanged state and stale/ABA revisions without state or audit mutation"])
     checks.extend(["exact retained filename lookup and cached stable input positions",
                    "website package pagination and explicit original download formats",
                    "Docker media publication and private staging routes",
