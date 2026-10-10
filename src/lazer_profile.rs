@@ -161,11 +161,13 @@ pub(super) async fn enrich_user(
     for kind in ["favourite", "guest", "nominated"] {
         value[format!("{kind}_beatmapset_count")] = json!(0);
     }
-    let groups = sqlx::query("SELECT r.id,r.name FROM roles r JOIN user_roles ur ON ur.role_id=r.id WHERE ur.user_id=$1 ORDER BY r.id")
+    // Badge roles only, with the operator-chosen label and colour (osu-web group style).
+    let groups = sqlx::query("SELECT r.id,r.name,r.short_name,r.colour FROM roles r JOIN user_roles ur ON ur.role_id=r.id WHERE ur.user_id=$1 AND r.display_badge ORDER BY r.id")
         .bind(player.id).fetch_all(&state.pool).await?;
     value["groups"] = json!(groups.into_iter().map(|row| {
         let name: String = row.get("name");
-        json!({"id":row.get::<i64,_>("id"),"name":name,"short_name":name,"identifier":name,"colour":details.get::<String,_>("accent_color"),"playmodes":null,"is_probationary":false})
+        let colour = row.get::<Option<String>,_>("colour").unwrap_or_else(|| details.get::<String,_>("accent_color"));
+        json!({"id":row.get::<i64,_>("id"),"name":name,"short_name":row.get::<String,_>("short_name"),"identifier":name,"colour":colour,"playmodes":null,"is_probationary":false})
     }).collect::<Vec<_>>());
     value["is_admin"] = json!(player.can("*"));
     value["is_gmt"] = json!(player.can("users.moderate"));
