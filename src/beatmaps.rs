@@ -478,7 +478,7 @@ fn validate_official_search(value: &Value) -> Result<(), ApiError> {
     let invalid = || ApiError(StatusCode::BAD_GATEWAY, "invalid_official_search_response");
     let sets = value["beatmapsets"]
         .as_array()
-        .filter(|sets| sets.len() <= 50)
+        .filter(|sets| sets.len() <= 100)
         .ok_or_else(invalid)?;
     value["total"]
         .as_i64()
@@ -666,7 +666,7 @@ fn validate_server_search(value: &Value) -> Result<(), ApiError> {
     let invalid = || ApiError(StatusCode::BAD_GATEWAY, "invalid_server_search_response");
     let sets = value["beatmapsets"]
         .as_array()
-        .filter(|sets| sets.len() <= 50)
+        .filter(|sets| sets.len() <= 100)
         .ok_or_else(invalid)?;
     value["total"]
         .as_i64()
