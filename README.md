@@ -26,8 +26,8 @@ The stack is Rust (2024 edition), Axum, Tokio and SQLx/PostgreSQL, with shared
 domain types and a stable packet codec. Client compatibility remains experimental:
 isolated fixtures do not certify native behavior. Replay playback, multiplayer
 and private messages still need client verification. See the
-[current integration record](https://github.com/Illyavrs/Illyaverse/blob/main/apps/docs/content/docs/reference/release-readiness.md)
-and [protocol compatibility guide](https://github.com/Illyavrs/Illyaverse/blob/main/apps/docs/content/docs/reference/protocol-compatibility.md).
+[current integration record](https://github.com/Illyavrs/Illyaverse/blob/main/apps/docs/content/docs/status.md)
+and [protocol compatibility guide](https://github.com/Illyavrs/Illyaverse/blob/main/apps/docs/content/docs/status.md).
 
 ## Run with Illyaverse
 
@@ -41,8 +41,8 @@ docker compose up -d --build --wait
 
 Compose exposes Resonance on `127.0.0.1:8081`. `GET /health` checks database
 connectivity and returns `{"status":"ok","service":"resonance"}`.
-[Deployment](https://github.com/Illyavrs/Illyaverse/blob/main/apps/docs/content/docs/deploy/deployment.md)
-covers public HTTPS; [connection setup](https://github.com/Illyavrs/Illyaverse/blob/main/apps/docs/content/docs/clients/connection.md)
+[Deployment](https://github.com/Illyavrs/Illyaverse/blob/main/apps/docs/content/docs/deployment.md)
+covers public HTTPS; [connection setup](https://github.com/Illyavrs/Illyaverse/blob/main/apps/docs/content/docs/connecting-players.md)
 covers game connectivity and the launcher.
 
 ## Develop
@@ -60,7 +60,7 @@ Local execution needs PostgreSQL, Sanctuary and configured `DATABASE_URL`,
 `INTERNAL_SERVICE_KEY`, `SANCTUARY_INTERNAL_URL`, `PUBLIC_ORIGIN` and `STORAGE_PATH`.
 Both services must share storage. `RESONANCE_BIND` defaults to `0.0.0.0:8081`.
 The [development overlay](https://github.com/Illyavrs/Illyaverse/blob/main/compose.dev.yaml)
-exposes loopback database/API ports; [architecture](https://github.com/Illyavrs/Illyaverse/blob/main/apps/docs/content/docs/deploy/architecture.md)
+exposes loopback database/API ports; [architecture](https://github.com/Illyavrs/Illyaverse/blob/main/apps/docs/content/docs/architecture.md)
 explains routing. Database and realtime integration tests need isolated fixtures.
 
 ## Repository boundary
@@ -69,7 +69,7 @@ explains routing. Database and realtime integration tests need isolated fixtures
 `services/resonance` in [Illyaverse](https://github.com/Illyavrs/Illyaverse).
 The parent owns workspace manifests, lockfiles, shared crates, migrations and
 deployment configuration. Docker builds use its root as the context; a child
-clone lacks those inputs. See the [repository guide](https://github.com/Illyavrs/Illyaverse/blob/main/apps/docs/content/docs/deploy/repository-layout.md).
+clone lacks those inputs. See the [repository guide](https://github.com/Illyavrs/Illyaverse/blob/main/apps/docs/content/docs/architecture.md).
 
 Code is original and [MIT-licensed](https://github.com/Illyavrs/Illyaverse/blob/main/LICENSE).
 References inform protocol research; their code is not copied. Use scoped
