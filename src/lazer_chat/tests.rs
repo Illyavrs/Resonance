@@ -244,6 +244,23 @@ async fn open(base: &str, token: &str) -> Socket {
         .unwrap();
     socket
 }
+/// An expired access token on a live session closes the socket without ending the login.
+async fn closed_without_logout(socket: &mut Socket) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match socket.next().await {
+                None | Some(Err(_)) | Some(Ok(ClientMessage::Close(_))) => return,
+                Some(Ok(ClientMessage::Text(text))) => {
+                    let value: Value = serde_json::from_str(&text).unwrap();
+                    assert_ne!(value["event"], "logout", "refreshable session was logged out");
+                }
+                Some(Ok(_)) => {}
+            }
+        }
+    })
+    .await
+    .expect("socket stayed open after its access token expired");
+}
 async fn event(socket: &mut Socket, name: &str) -> Value {
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
@@ -453,7 +470,7 @@ async fn native_chat_http_and_websocket() {
         receiver.send(ClientMessage::Text(r#"{"event":"chat.start"}"#.into())).await.unwrap();tokio::time::sleep(Duration::from_millis(50)).await;
         submit(&client,&base,&tokens[1],pm,"resumed notification","resume-1").await;assert_eq!(next_message(&mut receiver).await["messages"][0]["content"],"resumed notification");next_message(&mut sender).await;
         sqlx::query("DELETE FROM user_roles WHERE user_id=$1").bind(ids[1]).execute(&pool).await.unwrap();assert_eq!(submit(&client,&base,&tokens[1],pm,"revoked send","revoked-1").await.status(),StatusCode::FORBIDDEN);
-        sqlx::query("UPDATE lazer_sessions SET access_expires_at=now()-interval '1 second' WHERE access_hash=$1").bind(common::token_hash(&tokens[0])).execute(&pool).await.unwrap();event(&mut receiver,"logout").await;
+        sqlx::query("UPDATE lazer_sessions SET access_expires_at=now()-interval '1 second' WHERE access_hash=$1").bind(common::token_hash(&tokens[0])).execute(&pool).await.unwrap();closed_without_logout(&mut receiver).await;
         sqlx::query("DELETE FROM lazer_sessions WHERE access_hash=$1").bind(common::token_hash(&tokens[2])).execute(&pool).await.unwrap();event(&mut observer,"logout").await;
         sqlx::query("UPDATE users SET is_restricted=true WHERE id=$1").bind(ids[1]).execute(&pool).await.unwrap();event(&mut sender,"logout").await;
         let _=sender.close(None).await;let _=receiver.close(None).await;let _=observer.close(None).await;

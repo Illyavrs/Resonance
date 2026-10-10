@@ -1034,6 +1034,19 @@ async fn replay_on_start(
     }
     Ok(())
 }
+/// Whether the login session behind a connection can still mint access tokens.
+async fn session_refreshable(state: &AppState, session_id: Option<uuid::Uuid>) -> bool {
+    let Some(id) = session_id else {
+        return false;
+    };
+    sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM lazer_sessions s JOIN users u ON u.id=s.user_id WHERE s.id=$1 AND s.refresh_expires_at>clock_timestamp() AND NOT u.is_restricted)",
+    )
+    .bind(id)
+    .fetch_one(&state.pool)
+    .await
+    .unwrap_or(false)
+}
 async fn connection(
     mut socket: WebSocket,
     state: AppState,
@@ -1041,6 +1054,18 @@ async fn connection(
     mut events: broadcast::Receiver<Value>,
     _permit: SocketPermit,
 ) {
+    // Access tokens rotate every hour; the login session behind them does not.
+    let session_id = match common::bearer_hash(&headers) {
+        Ok(hash) => sqlx::query_scalar::<_, uuid::Uuid>(
+            "SELECT id FROM lazer_sessions WHERE access_hash=$1",
+        )
+        .bind(hash)
+        .fetch_optional(&state.pool)
+        .await
+        .ok()
+        .flatten(),
+        Err(_) => None,
+    };
     let mut active = false;
     let mut recovered = false;
     let mut known = HashMap::<i64, Value>::new();
@@ -1090,7 +1115,13 @@ async fn connection(
                 }
             },
             _=interval.tick()=>{
-                let Ok(user)=common::bearer(&state,&headers).await else{let _=emit(&mut socket,"logout",json!({})).await;break;};
+                let Ok(user)=common::bearer(&state,&headers).await else{
+                    // An expired or rotated access token is not a logout: the client
+                    // refreshes it and reconnects. Only a revoked session or restricted
+                    // account ends the login.
+                    if !session_refreshable(&state,session_id).await{let _=emit(&mut socket,"logout",json!({})).await;}
+                    break;
+                };
                 if !active{continue;}let Ok(current)=joined(&state,&user).await else{break;};
                 let mut failed=false;
                 for (id,channel) in &known{if !current.contains_key(id)&&emit(&mut socket,"chat.channel.part",channel.clone()).await.is_err(){failed=true;break;}}
