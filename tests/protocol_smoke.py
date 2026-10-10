@@ -35,6 +35,78 @@ from py3rijndael import Pkcs7Padding, RijndaelCbc
 STABLE_SCORE_REQUEST_CAP_BYTES = 20 * 1024 * 1024
 
 
+def public_distribution_identity(anonymous, uploaded):
+    """Verify delivered chart IDs against the public identity, not archive order."""
+    public = anonymous.json("GET", f"/api/v1/beatmaps/{uploaded['id']}")
+    assert public["id"] == uploaded["id"]
+    for key in ("native_id", "native_set_id"):
+        assert type(public[key]) is int and 2_000_000_000 <= public[key] <= 2_147_483_647
+        assert public[key] == uploaded[key]
+    assert public["local_package_id"] == uploaded["local_package_id"]
+    return public
+
+
+def assert_distribution_osu(delivered, original, identity):
+    """Independently parse IDs and preserve every byte outside metadata IDs."""
+    def inspect(contents):
+        assert contents.startswith(b"osu file format v14\n")
+        section, sections, ids, retained = None, set(), {}, []
+        for line in contents.splitlines(keepends=True):
+            stripped = line.strip()
+            if stripped.startswith(b"[") and stripped.endswith(b"]"):
+                section = stripped
+                sections.add(section)
+            key, separator, value = stripped.partition(b":")
+            if section == b"[Metadata]" and separator and key in (b"BeatmapID", b"BeatmapSetID"):
+                assert key not in ids, (key, "duplicate metadata identity")
+                ids[key] = value
+            else:
+                retained.append(line)
+        assert {b"[General]", b"[Metadata]", b"[Difficulty]", b"[TimingPoints]", b"[HitObjects]"} <= sections
+        return ids, b"".join(retained)
+
+    _, source_content = inspect(original)
+    delivered_ids, delivered_content = inspect(delivered)
+    assert delivered_content == source_content, "Local chart changed outside metadata identity fields"
+    assert set(delivered_ids) == {b"BeatmapID", b"BeatmapSetID"}
+    for field, key in ((b"BeatmapID", "native_id"), (b"BeatmapSetID", "native_set_id")):
+        assert re.fullmatch(rb"[1-9][0-9]*", delivered_ids[field]), (field, "invalid positive identity")
+        assert int(delivered_ids[field]) == identity[key], (field, identity[key])
+    assert hashlib.md5(delivered).hexdigest() == identity["md5"], "Public checksum does not identify delivered chart"
+    return delivered
+
+
+def assert_distribution_archive(delivered, original, charts):
+    """Validate ZIP/CRC, all logical names/assets, and every derived chart."""
+    def members(contents, *, source=False):
+        assert zipfile.is_zipfile(io.BytesIO(contents)), "Invalid local .osz ZIP"
+        with zipfile.ZipFile(io.BytesIO(contents)) as archive:
+            assert archive.testzip() is None, "Local .osz CRC mismatch"
+            result = {}
+            for member in archive.infolist():
+                # Windows normalizes raw CP437 backslashes before CP932 decoding.
+                # Preserve the ZIP name so 0x5c remains a multibyte trail byte.
+                name = member.orig_filename
+                if source and not member.flag_bits & (1 << 11):
+                    name = name.encode("cp437").decode("cp932")
+                assert name not in result, (name, "duplicate ZIP member")
+                result[name] = archive.read(member)
+            return result
+
+    source_members = members(original, source=True)
+    delivered_members = members(delivered)
+    assert set(delivered_members) == set(source_members), "Local .osz lost or added members"
+    assert {name for name in source_members if name.lower().endswith(".osu")} == set(charts)
+    for name, source_bytes in source_members.items():
+        if name in charts:
+            original_chart, identity = charts[name]
+            assert source_bytes == original_chart, (name, "source chart provenance changed")
+            assert_distribution_osu(delivered_members[name], original_chart, identity)
+        else:
+            assert delivered_members[name] == source_bytes, (name, "package asset/audio bytes changed")
+    return delivered
+
+
 class Client:
     request_count = 0
 
@@ -704,8 +776,14 @@ def run():
         assert required_summary_keys <= set(summary) <= required_summary_keys | {"bpm", "max_combo"}
         assert summary["status"] == "graveyard"
     assert public_map["download_url"] == f"/api/v1/beatmaps/{map_pk}/download"
-    assert anonymous.request("GET", public_map["download_url"])[0] == archive
-    assert anonymous.request("GET", f"/api/v1/beatmaps/{map_pk}/osu")[0] == fixture
+    distributed_archive = anonymous.request("GET", public_map["download_url"])[0]
+    distributed_charts = {fixture_filename: (fixture, public_distribution_identity(anonymous, beatmap)),
+                          sibling_filename: (sibling_fixture, public_distribution_identity(anonymous, sibling))}
+    assert_distribution_archive(distributed_archive, archive, distributed_charts)
+    with zipfile.ZipFile(io.BytesIO(distributed_archive)) as package:
+        distributed_md5 = {name: hashlib.md5(package.read(name)).hexdigest() for name in distributed_charts}
+    assert_distribution_osu(anonymous.request("GET", f"/api/v1/beatmaps/{map_pk}/osu")[0],
+                            fixture, distributed_charts[fixture_filename][1])
     anonymous.request("GET", "/api/v1/beatmaps/9223372036854775807/package/difficulties", expected=404)
 
     version = "20261007"
@@ -748,27 +826,29 @@ def run():
     bearer = {"Authorization": "Bearer " + oauth["access_token"]}
     assert gateway.json("GET", "/api/v2/me", headers=bearer)["id"] == player_id
     lookup = gateway.json("GET", "/api/v2/beatmaps/lookup?checksum=" + map_hash, headers=bearer)
-    assert lookup["id"] == map_id and lookup["checksum"] == map_hash
+    assert lookup["id"] == map_id and lookup["checksum"] == distributed_md5[fixture_filename]
     filename_path = "/api/v2/beatmaps/lookup?" + urllib.parse.urlencode({"filename": fixture_filename})
     gateway.request("GET", filename_path, expected=401)
     for filename, item in [(fixture_filename, beatmap), (sibling_filename, sibling)]:
         named = gateway.json("GET", "/api/v2/beatmaps/lookup?" + urllib.parse.urlencode({"filename": filename}), headers=bearer)
-        assert named["id"] == item["native_id"] and named["checksum"] == item["md5"]
+        assert named["id"] == item["native_id"] and named["checksum"] == distributed_md5[filename]
         assert named["beatmapset_id"] == set_id and "filename" not in named and "osu_path" not in named
     gateway.request("GET", "/api/v2/beatmaps/lookup?filename=../invalid.osu", headers=bearer, expected=400)
     stronger = gateway.json("GET", "/api/v2/beatmaps/lookup?" + urllib.parse.urlencode({"checksum": map_hash, "filename": "Wrong.osu"}), headers=bearer)
-    assert stronger["id"] == map_id and stronger["checksum"] == map_hash
+    assert stronger["id"] == map_id and stronger["checksum"] == distributed_md5[fixture_filename]
     filename_info = gateway.request("POST", "/web/osu-getbeatmapinfo.php?" + urllib.parse.urlencode({"u": player_name, "h": digest(player_password)}),
                                     {"Filenames": ["Uncached.osu", fixture_filename, sibling_filename], "Ids": []})[0].decode()
-    assert filename_info == f"1|{map_id}|{set_id}|{map_hash}|0|N|N|N|N\n2|{sibling['native_id']}|{set_id}|{sibling['md5']}|0|N|N|N|N"
-    assert {item["checksum"] for item in gateway.json("GET", f"/api/v2/beatmapsets/lookup?beatmap_id={map_id}", headers=bearer)["beatmaps"]} == {map_hash, sibling["md5"]}
+    assert filename_info == f"1|{map_id}|{set_id}|{distributed_md5[fixture_filename]}|0|N|N|N|N\n2|{sibling['native_id']}|{set_id}|{distributed_md5[sibling_filename]}|0|N|N|N|N"
+    assert {item["checksum"] for item in gateway.json("GET", f"/api/v2/beatmapsets/lookup?beatmap_id={map_id}", headers=bearer)["beatmaps"]} == set(distributed_md5.values())
     grouped = gateway.json("GET", f"/api/v2/beatmapsets/{set_id}", headers=bearer)
-    assert {item["checksum"] for item in grouped["beatmaps"]} == {map_hash, sibling["md5"]}
+    assert {item["checksum"] for item in grouped["beatmaps"]} == set(distributed_md5.values())
     assert gateway.json("GET", f"/api/v2/beatmapsets/lookup?beatmap_id={sibling['native_id']}", headers=bearer)["id"] == set_id
     package_search = gateway.json("GET", "/api/v2/beatmapsets/search?source=local&q=Protocol%20fixture", headers=bearer)
     assert package_search["total"] == 1 and package_search["beatmapsets"][0]["id"] == set_id
-    assert gateway.request("GET", f"/api/v2/beatmapsets/{set_id}/download", headers=bearer)[0] == archive
-    assert gateway.request("GET", f"/d/{set_id}")[0] == archive
+    assert assert_distribution_archive(gateway.request("GET", f"/api/v2/beatmapsets/{set_id}/download", headers=bearer)[0],
+                                       archive, distributed_charts) == distributed_archive
+    assert assert_distribution_archive(gateway.request("GET", f"/d/{set_id}")[0],
+                                       archive, distributed_charts) == distributed_archive
     assert gateway.request("GET", f"/osu/{sibling['native_id']}")[0] == sibling_fixture
     for invalid in [2_147_483_648, 9_223_372_036_854_775_807]:
         gateway.request("GET", f"/api/v2/beatmaps/{invalid}", headers=bearer, expected=400)
@@ -1305,7 +1385,16 @@ def run():
     player_site = Client(admin.base)
     player_site.json("POST", "/api/v1/auth/login", {"username": player_name, "password": player_password})
     availability_path = f"/api/v1/admin/beatmapsets/{set_id}/availability"
+    # Freeze the delivery representation before testing withdrawal invariants.
+    # Accepted score inputs and legacy raw /osu provenance remain the source MD5.
+    rx_archive_bytes = rx_archive.getvalue()
+    rx_distributed_archive = gateway.request("GET", f"/api/v2/beatmapsets/{set_id}/download", headers=bearer)[0]
+    rx_distributed_charts = {"independent-rx.osu": (rx_fixture, public_distribution_identity(anonymous, rx_map))}
+    assert_distribution_archive(rx_distributed_archive, rx_archive_bytes, rx_distributed_charts)
+    with zipfile.ZipFile(io.BytesIO(rx_distributed_archive)) as package:
+        rx_distributed_md5 = hashlib.md5(package.read("independent-rx.osu")).hexdigest()
     retained_before = admin.json("GET", f"/api/v1/admin/beatmaps/{map_pk}")
+    assert retained_before["md5"] == rx_distributed_md5
     current_revision = retained_before["availability"]["revision"]
     assert not retained_before["availability"]["withdrawn"]
     private_reason = "PRIVATE_WITHDRAWAL_FIXTURE_" + uuid.uuid4().hex
@@ -1321,9 +1410,7 @@ def run():
     assert anonymous.json("GET", "/api/v1/beatmaps?" + catalogue_query)["total"] == 1
     rx_filename_path = "/api/v2/beatmaps/lookup?" + urllib.parse.urlencode({"filename": "independent-rx.osu"})
     assert gateway.json("GET", rx_filename_path, headers=bearer)["id"] == map_id
-    assert gateway.json("GET", f"/api/v2/beatmapsets/{set_id}", headers=bearer)["beatmaps"][0]["checksum"] == map_hash
-    rx_archive_bytes = rx_archive.getvalue()
-    assert gateway.request("GET", f"/api/v2/beatmapsets/{set_id}/download", headers=bearer)[0] == rx_archive_bytes
+    assert gateway.json("GET", f"/api/v2/beatmapsets/{set_id}", headers=bearer)["beatmaps"][0]["checksum"] == rx_distributed_md5
     pending_token = gateway.json("POST", f"/api/v2/beatmaps/{map_id}/solo/scores", nm_token_fields,
                                 dict(bearer, **{"Content-Type": "application/x-www-form-urlencoded"}))["id"]
     nm_payload = dict(score, max_combo=rx_count, statistics={"great": rx_count}, maximum_statistics={"great": rx_count})
@@ -1429,8 +1516,10 @@ def run():
     assert "reason" not in restored_map["availability"] and private_reason not in json.dumps(restored_map)
     assert gateway.json("GET", rx_filename_path, headers=bearer)["id"] == map_id
     assert gateway.request("GET", f"/osu/{map_id}")[0] == rx_fixture
-    assert gateway.request("GET", f"/d/{set_id}")[0] == rx_archive_bytes
-    assert anonymous.request("GET", f"/api/v1/beatmaps/{map_pk}/download")[0] == rx_archive_bytes
+    assert assert_distribution_archive(gateway.request("GET", f"/d/{set_id}")[0],
+                                       rx_archive_bytes, rx_distributed_charts) == rx_distributed_archive
+    assert assert_distribution_archive(anonymous.request("GET", f"/api/v1/beatmaps/{map_pk}/download")[0],
+                                       rx_archive_bytes, rx_distributed_charts) == rx_distributed_archive
     assert anonymous.json("GET", f"/api/v1/scores/{rx_stable_id}") == history_before
     assert anonymous.json("GET", f"/api/v1/users/{player_id}?mode=0&variant=relax")["statistics"] == stats_before_withdrawal
     assert [entry["id"] for entry in anonymous.json("GET", f"/api/v1/users/{player_id}/scores/best?mode=0&variant=relax")["items"]] == [entry["id"] for entry in best_before["items"]]
@@ -1525,24 +1614,34 @@ def run():
     assert len({item["native_id"] for item in cp932_uploaded}) == 2
     assert {item["native_set_id"] for item in cp932_uploaded} == {cp932_set_id}
     assert len({item["local_package_id"] for item in cp932_uploaded}) == 1
+    cp932_distributed_archive = anonymous.request("GET", f"/api/v1/beatmaps/{cp932_uploaded[0]['id']}/download")[0]
+    cp932_distributed_charts = {filename: (contents, public_distribution_identity(anonymous, cp932_by_name[filename]))
+                                for _, filename, contents in cp932_members}
+    assert_distribution_archive(cp932_distributed_archive, cp932_archive, cp932_distributed_charts)
+    with zipfile.ZipFile(io.BytesIO(cp932_distributed_archive)) as package:
+        cp932_distributed_md5 = {name: hashlib.md5(package.read(name)).hexdigest() for name in cp932_distributed_charts}
     for _, filename, contents in cp932_members:
         item = cp932_by_name[filename]
         named = gateway.json("GET", "/api/v2/beatmaps/lookup?" + urllib.parse.urlencode({"filename": filename}),
                              headers=archive_name_bearer)
-        assert named["id"] == item["native_id"] and named["checksum"] == item["md5"]
+        assert named["id"] == item["native_id"] and named["checksum"] == cp932_distributed_md5[filename]
         assert named["beatmapset_id"] == cp932_set_id
         assert gateway.request("GET", f"/osu/{item['native_id']}")[0] == contents
-        assert anonymous.request("GET", f"/api/v1/beatmaps/{item['id']}/osu")[0] == contents
-        assert anonymous.request("GET", f"/api/v1/beatmaps/{item['id']}/download")[0] == cp932_archive
+        assert_distribution_osu(anonymous.request("GET", f"/api/v1/beatmaps/{item['id']}/osu")[0],
+                                contents, cp932_distributed_charts[filename][1])
+        assert assert_distribution_archive(anonymous.request("GET", f"/api/v1/beatmaps/{item['id']}/download")[0],
+                                           cp932_archive, cp932_distributed_charts) == cp932_distributed_archive
     cp932_stable_names = ["星.osu", "ソ.osu", "ソ.osu"]
     cp932_info = gateway.request("POST", "/web/osu-getbeatmapinfo.php?" + urllib.parse.urlencode(direct_auth),
                                 {"Filenames": cp932_stable_names, "Ids": []})[0].decode()
     assert cp932_info == "\n".join(
-        f"{position}|{cp932_by_name[filename]['native_id']}|{cp932_set_id}|{cp932_by_name[filename]['md5']}|0|N|N|N|N"
+        f"{position}|{cp932_by_name[filename]['native_id']}|{cp932_set_id}|{cp932_distributed_md5[filename]}|0|N|N|N|N"
         for position, filename in enumerate(cp932_stable_names))
-    assert gateway.request("GET", f"/d/{cp932_set_id}")[0] == cp932_archive
-    assert gateway.request("GET", f"/api/v2/beatmapsets/{cp932_set_id}/download",
-                           headers=archive_name_bearer)[0] == cp932_archive
+    assert assert_distribution_archive(gateway.request("GET", f"/d/{cp932_set_id}")[0],
+                                       cp932_archive, cp932_distributed_charts) == cp932_distributed_archive
+    assert assert_distribution_archive(gateway.request("GET", f"/api/v2/beatmapsets/{cp932_set_id}/download",
+                                                      headers=archive_name_bearer)[0],
+                                       cp932_archive, cp932_distributed_charts) == cp932_distributed_archive
 
     # Two same-name central records must be rejected before a ZIP library can
     # collapse them. Distinct owned map bytes would expose accidental publication.
@@ -1587,7 +1686,8 @@ def run():
     assert admin.json("GET", "/api/v1/admin/audit") == audit_before
     for item in cp932_uploaded:
         assert anonymous.json("GET", f"/api/v1/beatmaps/{item['id']}") == member_before[item["id"]]
-        assert anonymous.request("GET", f"/api/v1/beatmaps/{item['id']}/download")[0] == cp932_archive
+        assert assert_distribution_archive(anonymous.request("GET", f"/api/v1/beatmaps/{item['id']}/download")[0],
+                                           cp932_archive, cp932_distributed_charts) == cp932_distributed_archive
     filename_backfill = {"existing_aliases": 2, "inserted_aliases": 0, "audit_unchanged": True,
                          "map_and_archive_unchanged": True,
                          "http_requests": Client.request_count - backfill_initial_requests,
