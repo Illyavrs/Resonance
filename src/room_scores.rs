@@ -88,7 +88,7 @@ async fn create(
     let round = current
         .get::<Option<i64>, _>("current_round_id")
         .ok_or(invalid("room_round_required"))?;
-    let participant = sqlx::query("SELECT p.*,b.native_id,b.md5,r.expires_at FROM lazer_room_round_participants p JOIN lazer_room_rounds r ON r.id=p.round_id JOIN beatmaps b ON b.id=p.beatmap_id JOIN lazer_room_members m ON m.room_id=r.room_id AND m.user_id=p.user_id WHERE p.round_id=$1 AND p.user_id=$2 AND r.room_id=$3 AND r.playlist_item_id=$4 AND r.status='loading' AND r.expires_at>now() AND p.aborted_at IS NULL AND m.state=2")
+    let participant = sqlx::query("SELECT p.*,b.native_id,b.md5,illya_beatmap_checksum_matches(b.id,p.beatmap_checksum) frozen_checksum_valid,r.expires_at FROM lazer_room_round_participants p JOIN lazer_room_rounds r ON r.id=p.round_id JOIN beatmaps b ON b.id=p.beatmap_id JOIN lazer_room_members m ON m.room_id=r.room_id AND m.user_id=p.user_id WHERE p.round_id=$1 AND p.user_id=$2 AND r.room_id=$3 AND r.playlist_item_id=$4 AND r.status='loading' AND r.expires_at>now() AND p.aborted_at IS NULL AND m.state=2")
         .bind(round).bind(player.id).bind(room).bind(item).fetch_optional(&mut *tx).await?
         .ok_or(invalid("room_loading_participant_required"))?;
     if current.get::<i16, _>("state") != 1 {
@@ -105,9 +105,7 @@ async fn create(
         || !participant
             .get::<String, _>("beatmap_checksum")
             .eq_ignore_ascii_case(&input.beatmap_hash)
-        || !participant
-            .get::<String, _>("md5")
-            .eq_ignore_ascii_case(&input.beatmap_hash)
+        || !participant.get::<bool, _>("frozen_checksum_valid")
     {
         return Err(invalid("room_score_context_mismatch"));
     }
@@ -117,6 +115,9 @@ async fn create(
             || previous.get::<i64, _>("playlist_item_id") != item
             || previous.get::<i64, _>("beatmap_id") != map
             || previous.get::<i16, _>("ruleset_id") != i16::from(input.ruleset_id)
+            || !previous.get::<Option<String>, _>("client_beatmap_md5")
+                .unwrap_or_else(|| participant.get("md5"))
+                .eq_ignore_ascii_case(&input.beatmap_hash)
             || previous.get::<String, _>("version_hash") != input.version_hash
             || previous.get::<Option<DateTime<Utc>>, _>("revoked_at").is_some()
         {
@@ -124,9 +125,10 @@ async fn create(
         }
         previous.get::<i64, _>("id")
     } else {
-        sqlx::query_scalar::<_, i64>("INSERT INTO lazer_score_tokens(user_id,beatmap_id,ruleset_id,version_hash,expires_at,scope,room_id,playlist_item_id,round_id) VALUES($1,$2,$3,$4,$5,'room',$6,$7,$8) RETURNING id")
+        sqlx::query_scalar::<_, i64>("INSERT INTO lazer_score_tokens(user_id,beatmap_id,ruleset_id,version_hash,expires_at,scope,room_id,playlist_item_id,round_id,client_beatmap_md5) VALUES($1,$2,$3,$4,$5,'room',$6,$7,$8,$9) RETURNING id")
             .bind(player.id).bind(map).bind(i16::from(input.ruleset_id)).bind(input.version_hash)
             .bind(participant.get::<DateTime<Utc>, _>("expires_at")).bind(room).bind(item).bind(round)
+            .bind(input.beatmap_hash.to_ascii_lowercase())
             .fetch_one(&mut *tx).await?
     };
     tx.commit().await?;
@@ -141,7 +143,7 @@ async fn bound_token(
     token: i64,
     uid: i64,
 ) -> Result<PgRow, ApiError> {
-    sqlx::query("SELECT t.*,p.beatmap_id frozen_map,p.ruleset_id frozen_ruleset,p.beatmap_checksum,p.mods frozen_mods,p.aborted_at participant_aborted,r.status round_status,r.expires_at round_expires,b.md5,b.native_id FROM lazer_score_tokens t JOIN lazer_room_rounds r ON r.id=t.round_id AND r.room_id=t.room_id AND r.playlist_item_id=t.playlist_item_id JOIN lazer_room_round_participants p ON p.round_id=t.round_id AND p.user_id=t.user_id JOIN beatmaps b ON b.id=t.beatmap_id WHERE t.id=$1 AND t.user_id=$2 AND t.scope='room' AND t.room_id=$3 AND t.playlist_item_id=$4 FOR UPDATE OF t")
+    sqlx::query("SELECT t.*,p.beatmap_id frozen_map,p.ruleset_id frozen_ruleset,p.beatmap_checksum,p.mods frozen_mods,p.aborted_at participant_aborted,r.status round_status,r.expires_at round_expires,b.md5,b.native_id,illya_beatmap_checksum_matches(b.id,p.beatmap_checksum) frozen_checksum_valid FROM lazer_score_tokens t JOIN lazer_room_rounds r ON r.id=t.round_id AND r.room_id=t.room_id AND r.playlist_item_id=t.playlist_item_id JOIN lazer_room_round_participants p ON p.round_id=t.round_id AND p.user_id=t.user_id JOIN beatmaps b ON b.id=t.beatmap_id WHERE t.id=$1 AND t.user_id=$2 AND t.scope='room' AND t.room_id=$3 AND t.playlist_item_id=$4 FOR UPDATE OF t")
         .bind(token).bind(uid).bind(room).bind(item).fetch_optional(&mut **tx).await?
         .ok_or(ApiError(StatusCode::NOT_FOUND, "invalid_room_score_token"))
 }
@@ -163,8 +165,10 @@ fn validate_binding_with_receipt(
     if row.get::<i64, _>("beatmap_id") != row.get::<i64, _>("frozen_map")
         || row.get::<i16, _>("ruleset_id") != row.get::<i16, _>("frozen_ruleset")
         || row.get::<i16, _>("ruleset_id") != i16::from(input.ruleset_id)
+        || !row.get::<bool, _>("frozen_checksum_valid")
         || !row
-            .get::<String, _>("md5")
+            .get::<Option<String>, _>("client_beatmap_md5")
+            .unwrap_or_else(|| row.get("md5"))
             .eq_ignore_ascii_case(&row.get::<String, _>("beatmap_checksum"))
         || canonical_mods(&json!(input.mods))?
             != canonical_mods(&row.get::<Value, _>("frozen_mods"))?
@@ -430,15 +434,17 @@ async fn process(
     input.validate()?;
     let mods = crate::lazer::legacy_mods(input.ruleset_id, &input.mods)?;
     // Read identity only; preflight persisted and claimed this immutable intent.
-    let map: i64 = sqlx::query_scalar("SELECT beatmap_id FROM lazer_score_tokens WHERE id=$1 AND user_id=$2 AND scope='room' AND room_id=$3 AND playlist_item_id=$4 AND submission=$5")
+    let context = sqlx::query("SELECT t.beatmap_id,COALESCE(t.client_beatmap_md5,b.md5) client_beatmap_md5 FROM lazer_score_tokens t JOIN beatmaps b ON b.id=t.beatmap_id WHERE t.id=$1 AND t.user_id=$2 AND t.scope='room' AND t.room_id=$3 AND t.playlist_item_id=$4 AND t.submission=$5")
         .bind(token).bind(uid).bind(room).bind(item).bind(payload).fetch_optional(&state.pool).await?
         .ok_or(invalid("invalid_room_score_token"))?;
+    let map: i64 = context.get("beatmap_id");
+    let client_checksum: String = context.get("client_beatmap_md5");
     let response = state.http.post(format!("{}/api/v1/internal/scores", state.sanctuary_url.trim_end_matches('/')))
         .header("x-illya-service-key", state.service_key.as_str())
         .json(&json!({"user_id":uid,"beatmap_id":map,"mode":input.ruleset_id,"score":input.total_score,
             "accuracy":input.accuracy*100.0,"max_combo":input.max_combo,"mods":mods,"api_mods":input.mods,
             "passed":input.passed,"hit_counts":input.legacy_hit_counts(),"native_submission":input,
-            "client":"lazer","ingestion_key":format!("lazer:{token}")}))
+            "client":"lazer","client_beatmap_md5":client_checksum,"ingestion_key":format!("lazer:{token}")}))
         .timeout(std::time::Duration::from_secs(30)).send().await
         .map_err(|_| unavailable("score_ingestion_unavailable"))?;
     if !response.status().is_success() {
@@ -498,7 +504,7 @@ async fn process(
     }
     // Sanctuary's old idempotency guard does not compare the entire input. This
     // extra check refuses a foreign/mutated orphan instead of attaching it.
-    let score = sqlx::query("SELECT user_id,beatmap_id,mode,score_variant,client,ingestion_key,native_submission,score,accuracy,max_combo,mods,passed,hit_counts,api_mods FROM scores WHERE id=$1 FOR SHARE")
+    let score = sqlx::query("SELECT s.user_id,s.beatmap_id,s.mode,s.score_variant,s.client,s.ingestion_key,s.native_submission,s.score,s.accuracy,s.max_combo,s.mods,s.passed,s.hit_counts,s.api_mods,COALESCE(s.client_beatmap_md5,b.md5) client_beatmap_md5 FROM scores s JOIN beatmaps b ON b.id=s.beatmap_id WHERE s.id=$1 FOR SHARE OF s")
         .bind(score_id).fetch_optional(&mut *tx).await?.ok_or(invalid("room_ingestion_link_mismatch"))?;
     let native_matches = score
         .get::<Option<Value>, _>("native_submission")
@@ -509,6 +515,9 @@ async fn process(
         });
     if score.get::<i64, _>("user_id") != uid
         || score.get::<i64, _>("beatmap_id") != map
+        || !score
+            .get::<String, _>("client_beatmap_md5")
+            .eq_ignore_ascii_case(&client_checksum)
         || score.get::<i16, _>("mode") != i16::from(input.ruleset_id)
         || score.get::<String, _>("score_variant")
             != illya_domain::ScoreVariant::from_legacy(input.ruleset_id, mods)
@@ -641,6 +650,6 @@ pub(crate) async fn processed_score_id(
     uid: i64,
     token: i64,
 ) -> Result<Option<i64>, ApiError> {
-    Ok(sqlx::query_scalar("SELECT t.score_id FROM lazer_score_tokens t JOIN users u ON u.id=t.user_id JOIN lazer_room_rounds r ON r.id=t.round_id AND r.room_id=t.room_id AND r.playlist_item_id=t.playlist_item_id JOIN lazer_room_round_participants p ON p.round_id=t.round_id AND p.user_id=t.user_id JOIN beatmaps b ON b.id=t.beatmap_id JOIN scores s ON s.id=t.score_id AND s.user_id=t.user_id AND s.beatmap_id=t.beatmap_id AND s.mode=t.ruleset_id AND s.client='lazer' AND s.ingestion_key='lazer:'||t.id::text WHERE t.id=$1 AND t.user_id=$2 AND t.scope='room' AND t.processing_status='processed' AND t.revoked_at IS NULL AND p.aborted_at IS NULL AND r.status<>'aborted' AND NOT u.is_restricted AND t.beatmap_id=p.beatmap_id AND t.ruleset_id=p.ruleset_id AND lower(b.md5)=lower(p.beatmap_checksum) AND s.verification<>'rejected'")
+    Ok(sqlx::query_scalar("SELECT t.score_id FROM lazer_score_tokens t JOIN users u ON u.id=t.user_id JOIN lazer_room_rounds r ON r.id=t.round_id AND r.room_id=t.room_id AND r.playlist_item_id=t.playlist_item_id JOIN lazer_room_round_participants p ON p.round_id=t.round_id AND p.user_id=t.user_id JOIN beatmaps b ON b.id=t.beatmap_id JOIN scores s ON s.id=t.score_id AND s.user_id=t.user_id AND s.beatmap_id=t.beatmap_id AND s.mode=t.ruleset_id AND s.client='lazer' AND s.ingestion_key='lazer:'||t.id::text WHERE t.id=$1 AND t.user_id=$2 AND t.scope='room' AND t.processing_status='processed' AND t.revoked_at IS NULL AND p.aborted_at IS NULL AND r.status<>'aborted' AND NOT u.is_restricted AND t.beatmap_id=p.beatmap_id AND t.ruleset_id=p.ruleset_id AND illya_beatmap_checksum_matches(b.id,p.beatmap_checksum) AND lower(COALESCE(t.client_beatmap_md5,b.md5))=lower(p.beatmap_checksum) AND lower(COALESCE(s.client_beatmap_md5,b.md5))=lower(p.beatmap_checksum) AND s.verification<>'rejected'")
         .bind(token).bind(uid).fetch_optional(&state.pool).await?.flatten())
 }

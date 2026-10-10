@@ -906,15 +906,18 @@ pub async fn beatmap_archive(
         .trim_end_matches('n')
         .parse()
         .map_err(|_| ApiError(StatusCode::BAD_REQUEST, "invalid_beatmap_id"))?;
-    let bytes = crate::native_archives::bytes(&state, id, None).await?;
+    let archive = crate::native_archives::download(&state, id, None).await?;
     Ok((
         [
-            ("content-type", "application/x-osu-beatmap-archive"),
-            ("content-disposition", "attachment; filename=beatmap.osz"),
-            ("cache-control", "private, no-store"),
-            ("x-content-type-options", "nosniff"),
+            (
+                "content-type",
+                "application/x-osu-beatmap-archive".to_owned(),
+            ),
+            ("content-disposition", archive.content_disposition),
+            ("cache-control", "private, no-store".to_owned()),
+            ("x-content-type-options", "nosniff".to_owned()),
         ],
-        bytes,
+        archive.bytes,
     )
         .into_response())
 }
@@ -1090,7 +1093,7 @@ async fn search_set(
         if !wire::is_md5(md5) {
             return Err(ApiError(StatusCode::BAD_REQUEST, "invalid_beatmap_hash"));
         }
-        sqlx::query_scalar("SELECT native_set_id FROM beatmaps WHERE md5=$1")
+        sqlx::query_scalar("SELECT b.native_set_id FROM beatmap_checksum_identities c JOIN beatmaps b ON b.id=c.beatmap_id WHERE c.md5=$1")
             .bind(md5.to_ascii_lowercase())
             .fetch_optional(&state.pool)
             .await?
@@ -1248,7 +1251,7 @@ async fn beatmap_info(
     let mut lines = Vec::new();
     for (index, local_id) in &resolved {
         if let Some(row) =
-            sqlx::query("SELECT id,native_id,native_set_id,md5,status FROM beatmaps WHERE id=$1")
+            sqlx::query("SELECT id,native_id,native_set_id,illya_beatmap_preferred_checksum(id) AS md5,status FROM beatmaps WHERE id=$1")
                 .bind(local_id)
                 .fetch_optional(&state.pool)
                 .await?

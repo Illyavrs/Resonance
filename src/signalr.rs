@@ -866,12 +866,13 @@ async fn playlist_item(
         return Err("invalid_ruleset");
     }
     let checksum = text(field(value, "beatmapChecksum", 3), 32)?;
-    let row = sqlx::query("SELECT md5,mode,stars,native_set_id FROM beatmaps WHERE native_id=$1")
-        .bind(beatmap_id)
-        .fetch_optional(&mut **tx)
-        .await
-        .map_err(db)?
-        .ok_or("beatmap_not_found")?;
+    let row =
+        sqlx::query("SELECT id,md5,mode,stars,native_set_id FROM beatmaps WHERE native_id=$1")
+            .bind(beatmap_id)
+            .fetch_optional(&mut **tx)
+            .await
+            .map_err(db)?
+            .ok_or("beatmap_not_found")?;
     crate::native_maps::lock_active_set(tx, row.get("native_set_id"))
         .await
         .map_err(|error| error.1)?;
@@ -879,10 +880,20 @@ async fn playlist_item(
     if mapmode != 0 && i64::from(mapmode) != ruleset {
         return Err("invalid_ruleset_conversion");
     }
-    let actual: String = row.get("md5");
-    if checksum != actual {
-        return Err("beatmap_checksum_mismatch");
-    }
+    crate::native_maps::require_checksum(&mut **tx, row.get("id"), &checksum)
+        .await
+        .map_err(|error| {
+            if error.0 == StatusCode::BAD_REQUEST {
+                "beatmap_checksum_mismatch"
+            } else {
+                error.1
+            }
+        })?;
+    let actual: String = sqlx::query_scalar("SELECT illya_beatmap_preferred_checksum($1)")
+        .bind(row.get::<i64, _>("id"))
+        .fetch_one(&mut **tx)
+        .await
+        .map_err(db)?;
     let required = mods(field(value, "requiredMods", 5))?;
     crate::room_rounds::canonical_mods(ruleset as u8, &required).map_err(|e| e.1)?;
     let allowed = mods(field(value, "allowedMods", 6))?;

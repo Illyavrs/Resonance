@@ -15,6 +15,13 @@ use resonance_protocol::lazer::{
 use serde::{Deserialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use sqlx::Row;
+#[path = "lazer_leaderboard.rs"]
+mod leaderboard;
+#[path = "lazer_profile.rs"]
+mod profile;
+#[path = "lazer_sessions.rs"]
+mod sessions;
+pub(crate) use leaderboard::mod_filter as leaderboard_mod_filter;
 #[path = "lazer_solo.rs"]
 mod solo_scores;
 pub(crate) use solo_scores::{
@@ -51,6 +58,8 @@ pub fn router() -> Router<AppState> {
         .route("/api/v2/blocks/{id}", axum::routing::delete(remove_block))
         .route("/api/v2/seasonal-backgrounds", get(backgrounds))
         .route("/api/v2/news", get(news))
+        .merge(profile::router())
+        .merge(sessions::router())
 }
 
 async fn oauth(
@@ -117,12 +126,7 @@ async fn oauth(
             common::account_in_tx(&mut tx, user_id).await?
         }
     };
-    sqlx::query(
-        "DELETE FROM lazer_sessions WHERE user_id=$1 AND refresh_expires_at<clock_timestamp()",
-    )
-    .bind(player.id)
-    .execute(&mut *tx)
-    .await?;
+    sessions::cleanup_expired(&mut tx, player.id).await?;
     if !refreshed_session {
         sqlx::query("INSERT INTO lazer_sessions(id,user_id,access_hash,refresh_hash,access_expires_at,refresh_expires_at) VALUES($1,$2,$3,$4,$5,$6)").bind(uuid::Uuid::new_v4()).bind(player.id).bind(common::token_hash(&access)).bind(common::token_hash(&refresh)).bind(Utc::now()+Duration::hours(1)).bind(Utc::now()+Duration::days(30)).execute(&mut *tx).await?;
     }
@@ -214,9 +218,21 @@ pub(crate) async fn native_form<T: DeserializeOwned>(request: Request) -> Result
 }
 
 pub fn user_json(player: &Account) -> Value {
-    json!({"id":player.id,"username":player.username,"country_code":player.country,"avatar_url":player.avatar_url,"is_active":true,"is_bot":false,"is_online":player.is_online,"is_supporter":true,"is_deleted":false,"pm_friends_only":false,"last_visit":null,"join_date":player.joined_at,"profile_colour":null,"playmode":"osu","playstyle":[],"country":{"code":player.country,"name":player.country},"cover":{"custom_url":null,"url":null,"id":"0"},"groups":[],"user_achievements":[],"kudosu":{"total":0,"available":0},"statistics":null})
+    json!({"id":player.id,"username":player.username,"country_code":player.country,"avatar_url":profile::avatar_url(player.avatar_url.as_deref()),"is_active":true,"is_bot":false,"is_online":player.is_online,"is_supporter":true,"is_deleted":false,"pm_friends_only":false,"last_visit":null,"join_date":player.joined_at,"profile_colour":null,"playmode":"osu","playstyle":[],"country":{"code":player.country,"name":player.country},"cover":{"custom_url":null,"url":null,"id":"0"},"groups":[],"user_achievements":[],"kudosu":{"total":0,"available":0},"statistics":null})
 }
 async fn user_response(
+    state: &AppState,
+    player: Account,
+    mode: u8,
+    variant: ScoreVariant,
+) -> Result<Json<Value>, ApiError> {
+    let mut value = user_response_base(state, player.clone(), mode, variant)
+        .await?
+        .0;
+    profile::enrich_user(state, &player, mode, variant, &mut value).await?;
+    Ok(Json(value))
+}
+async fn user_response_base(
     state: &AppState,
     player: Account,
     mode: u8,
@@ -389,13 +405,16 @@ async fn user_scores(
             sqlx::query_scalar::<_,i64>("SELECT id FROM scores WHERE user_id=$1 AND mode=$2 AND score_variant=$3 AND (verification='verified' OR user_id=$4) AND ($5 OR passed) ORDER BY id DESC LIMIT $6 OFFSET $7")
                 .bind(owner.id).bind(i16::from(ruleset)).bind(variant.as_str()).bind(viewer.id).bind(include_fails).bind(limit).bind(offset).fetch_all(&state.pool).await?
         },
+        "firsts" => profile::first_score_ids(&state.pool, owner.id, ruleset, variant, limit, offset).await?,
+        // No pinning action exists yet, so the native list is accurately empty.
+        "pinned" => Vec::new(),
         _ => return Err(ApiError(StatusCode::BAD_REQUEST,"unsupported_score_list")),
     };
     let mut scores = Vec::with_capacity(ids.len());
     for score in ids {
         let value = score_json(&state, score, &viewer).await?;
         if kind != "best" || value["beatmap_withdrawn"] != true {
-            scores.push(value);
+            scores.push(profile::enrich_score(&state, value).await?);
         }
     }
     Ok(Json(json!(scores)))
@@ -466,7 +485,7 @@ async fn rankings(
     };
     let mut ranking = Vec::with_capacity(rows.len());
     for row in rows {
-        let profile = user_response(
+        let profile = user_response_base(
             &state,
             common::account(&state, row.get("id")).await?,
             ruleset,
@@ -526,12 +545,6 @@ async fn create_score(
     if map.get::<i64, _>("native_id") != id {
         return Err(ApiError(StatusCode::BAD_REQUEST, "beatmap_id_mismatch"));
     }
-    if !map
-        .get::<String, _>("md5")
-        .eq_ignore_ascii_case(&input.beatmap_hash)
-    {
-        return Err(ApiError(StatusCode::BAD_REQUEST, "beatmap_hash_mismatch"));
-    }
     let source_mode: i16 = map.get("mode");
     if source_mode != 0 && source_mode != i16::from(input.ruleset_id) {
         return Err(ApiError(
@@ -544,7 +557,8 @@ async fn create_score(
     let mut tx = state.pool.begin().await?;
     common::lazer_account_in_tx(&mut tx, &headers, player.id).await?;
     crate::native_maps::lock_active_set(&mut tx, map.get("native_set_id")).await?;
-    let token:i64=sqlx::query_scalar("INSERT INTO lazer_score_tokens(user_id,beatmap_id,ruleset_id,version_hash,expires_at,scope) VALUES($1,$2,$3,$4,$5,'solo') RETURNING id").bind(player.id).bind(internal).bind(i16::from(input.ruleset_id)).bind(input.version_hash).bind(Utc::now()+Duration::hours(6)).fetch_one(&mut *tx).await?;
+    crate::native_maps::require_checksum(&mut *tx, internal, &input.beatmap_hash).await?;
+    let token:i64=sqlx::query_scalar("INSERT INTO lazer_score_tokens(user_id,beatmap_id,ruleset_id,version_hash,expires_at,scope,client_beatmap_md5) VALUES($1,$2,$3,$4,$5,'solo',$6) RETURNING id").bind(player.id).bind(internal).bind(i16::from(input.ruleset_id)).bind(input.version_hash).bind(Utc::now()+Duration::hours(6)).bind(input.beatmap_hash.to_ascii_lowercase()).fetch_one(&mut *tx).await?;
     tx.commit().await?;
     Ok(Json(json!({"id":token})))
 }
@@ -692,20 +706,31 @@ async fn download_replay(
     Path(id): Path<i64>,
 ) -> Result<Response, ApiError> {
     let player = common::bearer(&state, &headers).await?;
-    let path = sqlx::query_scalar::<_, Option<String>>(
-        "SELECT replay_path FROM scores s JOIN users u ON u.id=s.user_id WHERE s.id=$1 AND NOT u.is_restricted AND (s.verification='verified' OR s.user_id=$2)",
+    let row = sqlx::query(
+        "SELECT s.replay_path,s.mode,b.native_id FROM scores s JOIN users u ON u.id=s.user_id JOIN beatmaps b ON b.id=s.beatmap_id WHERE s.id=$1 AND NOT u.is_restricted AND (s.verification='verified' OR s.user_id=$2)",
     )
     .bind(id)
     .bind(player.id)
     .fetch_optional(&state.pool)
     .await?
-    .flatten()
     .ok_or(ApiError(StatusCode::NOT_FOUND, "replay_not_found"))?;
+    let path = row
+        .get::<Option<String>, _>("replay_path")
+        .ok_or(ApiError(StatusCode::NOT_FOUND, "replay_not_found"))?;
+    let name =
+        illya_domain::download_filename::replay_filename(row.get("mode"), row.get("native_id"), id)
+            .ok_or(ApiError(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "invalid_stored_score_identity",
+            ))?;
     let bytes = common::stored_file(&state, &path, "replays", 16_777_216).await?;
     Ok((
         [
-            ("content-type", "application/x-osu-replay"),
-            ("content-disposition", "attachment; filename=score.osr"),
+            ("content-type", "application/x-osu-replay".to_owned()),
+            (
+                "content-disposition",
+                illya_domain::download_filename::attachment(&name),
+            ),
         ],
         bytes,
     )

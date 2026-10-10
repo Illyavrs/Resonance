@@ -125,7 +125,16 @@ async fn attempt(pool: &PgPool, owner: i64, score: i64, client: NativeClient, ke
     .await
     .unwrap();
     let result = if let Some(owner) = owner {
-        publish(&mut tx, score, owner, client, key).await.unwrap()
+        publish(
+            &mut tx,
+            score,
+            owner,
+            client,
+            key,
+            "0123456789abcdef0123456789abcdef",
+        )
+        .await
+        .unwrap()
     } else {
         false
     };
@@ -188,9 +197,16 @@ async fn native_publication_retries_are_atomic_and_single_audit() {
             .await
             .unwrap();
         assert!(
-            publish(&mut locked, score, f.owner, NativeClient::Stable, &key)
-                .await
-                .unwrap()
+            publish(
+                &mut locked,
+                score,
+                f.owner,
+                NativeClient::Stable,
+                &key,
+                "0123456789abcdef0123456789abcdef"
+            )
+            .await
+            .unwrap()
         );
         let mut tasks = Vec::new();
         for _ in 0..6 {
@@ -222,9 +238,16 @@ async fn native_publication_retries_are_atomic_and_single_audit() {
             .await
             .unwrap();
         assert!(
-            publish(&mut tx, rolled_back, f.owner, NativeClient::Stable, &key)
-                .await
-                .unwrap()
+            publish(
+                &mut tx,
+                rolled_back,
+                f.owner,
+                NativeClient::Stable,
+                &key,
+                "0123456789abcdef0123456789abcdef"
+            )
+            .await
+            .unwrap()
         );
         tx.rollback().await.unwrap();
         assert_eq!(
@@ -332,9 +355,16 @@ async fn native_publication_cannot_win_after_concurrent_owner_restriction() {
             .await
             .unwrap();
         assert!(
-            !publish(&mut tx, score, f.owner, NativeClient::Stable, &key)
-                .await
-                .unwrap()
+            !publish(
+                &mut tx,
+                score,
+                f.owner,
+                NativeClient::Stable,
+                &key,
+                "0123456789abcdef0123456789abcdef"
+            )
+            .await
+            .unwrap()
         );
         tx.rollback().await.unwrap();
     })

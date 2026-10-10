@@ -48,6 +48,18 @@ fn native_archive_transport_headers_and_service_errors_are_strict() {
     headers.insert("content-type", "application/x-osu-archive".parse().unwrap());
     headers.insert("x-illya-archive-sha256", "a".repeat(64).parse().unwrap());
     assert_eq!(response_digest(&headers).unwrap(), "a".repeat(64));
+    let filename =
+        illya_domain::download_filename::archive_filename(SET, "Fixture artist", "Fixture title")
+            .unwrap();
+    let disposition = illya_domain::download_filename::attachment(&filename);
+    headers.insert("content-disposition", disposition.parse().unwrap());
+    assert_eq!(response_name(&headers, SET).unwrap(), disposition);
+    assert!(response_name(&headers, SET + 1).is_err());
+    headers.insert(
+        "content-disposition",
+        "attachment; filename=untrusted.osz".parse().unwrap(),
+    );
+    assert!(response_name(&headers, SET).is_err());
     for bad in [
         "A".repeat(64),
         "g".repeat(64),
@@ -120,11 +132,16 @@ async fn archive_backend(
             .expect("fixture releases its provider response");
     }
     let digest = format!("{:x}", Sha256::digest(BYTES));
+    let disposition = illya_domain::download_filename::attachment(
+        &illya_domain::download_filename::archive_filename(SET, "Fixture artist", "Fixture title")
+            .unwrap(),
+    );
     match state.reply.lock().await.clone() {
         Reply::Bytes => (
             [
                 ("content-type", "application/x-osu-archive"),
                 ("x-illya-archive-sha256", digest.as_str()),
+                ("content-disposition", disposition.as_str()),
             ],
             BYTES,
         )
@@ -133,6 +150,7 @@ async fn archive_backend(
             [
                 ("content-type", "application/x-osu-archive"),
                 ("x-illya-archive-sha256", "0".repeat(64).as_str()),
+                ("content-disposition", disposition.as_str()),
             ],
             BYTES,
         )
@@ -149,6 +167,7 @@ async fn archive_backend(
             .status(200)
             .header("content-type", "application/x-osu-archive")
             .header("x-illya-archive-sha256", digest)
+            .header("content-disposition", disposition)
             .header("content-length", (MAX_PROVIDER_BYTES + 1).to_string())
             .body(Body::from_stream(futures_util::stream::once(async {
                 Ok::<_, std::io::Error>(b"x".as_slice())
@@ -166,6 +185,7 @@ async fn archive_backend(
                 .status(200)
                 .header("content-type", "application/x-osu-archive")
                 .header("x-illya-archive-sha256", digest)
+                .header("content-disposition", disposition)
                 .body(Body::from_stream(stream))
                 .unwrap()
         }
@@ -379,6 +399,17 @@ database_test!(
             assert_eq!(bytes, BYTES);
             assert_eq!(headers["content-type"], "application/x-osu-beatmap-archive");
             assert_eq!(headers["cache-control"], "private, no-store");
+            assert_eq!(
+                headers["content-disposition"],
+                illya_domain::download_filename::attachment(
+                    &illya_domain::download_filename::archive_filename(
+                        SET,
+                        "Fixture artist",
+                        "Fixture title"
+                    )
+                    .unwrap()
+                )
+            );
             assert!(headers.get("location").is_none());
         }
         let calls = f.backend.calls.lock().await;

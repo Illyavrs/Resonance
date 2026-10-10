@@ -289,6 +289,7 @@ pub(crate) async fn set_json(state: &AppState, user_id: i64, id: i64) -> Result<
             set["status"] = json!(status);
         }
     }
+    crate::native_media::decorate_set(&mut set)?;
     native_maps::require_active(&state.pool, id).await?;
     Ok(set)
 }

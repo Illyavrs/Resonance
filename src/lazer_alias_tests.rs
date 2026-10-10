@@ -100,7 +100,13 @@ async fn empty_ruleset_user_aliases_return_identical_authenticated_api_models() 
                     let value:Value=serde_json::from_slice(&to_bytes(response.into_body(),65536).await.unwrap()).unwrap();
                     assert_eq!(value["id"],id); assert_eq!(value["username"],"UserAlias");
                     assert_eq!(value["playmode"],"osu"); assert!(value["statistics"].is_object());
-                    models.push(value);
+                    // Bearer authentication records a real last-seen timestamp
+                    // for every request. Aliases share the same data contract,
+                    // while that observation naturally advances between reads.
+                    assert!(value["last_visit"].is_string());
+                    let mut comparable=value;
+                    comparable.as_object_mut().unwrap().remove("last_visit");
+                    models.push(comparable);
                     let response=app.clone().oneshot(Request::builder().method(Method::HEAD).uri(format!("{path}{suffix}{query}")).header("authorization",format!("Bearer {token}")).body(Body::empty()).unwrap()).await.unwrap();
                     assert_eq!(response.status(),StatusCode::OK); assert!(response.headers().get("location").is_none());
                     assert!(to_bytes(response.into_body(),65536).await.unwrap().is_empty());

@@ -93,19 +93,27 @@ async fn preflight(
 ) -> Result<Preflight, ApiError> {
     let mut tx = state.pool.begin().await?;
     common::lazer_account_in_tx(&mut tx, headers, uid).await?;
-    let row = sqlx::query("SELECT t.* FROM lazer_score_tokens t JOIN beatmaps b ON b.id=t.beatmap_id WHERE t.id=$1 AND t.user_id=$2 AND t.scope='solo' AND b.native_id=$3 AND (t.expires_at>now() OR t.score_id IS NOT NULL) FOR UPDATE OF t")
+    let row = sqlx::query("SELECT t.*,COALESCE(t.client_beatmap_md5,b.md5) client_checksum FROM lazer_score_tokens t JOIN beatmaps b ON b.id=t.beatmap_id WHERE t.id=$1 AND t.user_id=$2 AND t.scope='solo' AND b.native_id=$3 AND (t.expires_at>now() OR t.score_id IS NOT NULL) FOR UPDATE OF t")
         .bind(token).bind(uid).bind(native_map).fetch_optional(&mut *tx).await?
         .ok_or(ApiError(StatusCode::NOT_FOUND, "invalid_score_token"))?;
     validate_intent(&row, payload, input)?;
     if let Some(score) = row.get::<Option<i64>, _>("score_id") {
         // Older linked receipts may predate durable intent metadata. Exact
         // score identity is still checked before returning their receipt.
-        let saved = sqlx::query("SELECT * FROM scores WHERE id=$1 FOR SHARE")
+        let saved = sqlx::query("SELECT s.*,COALESCE(s.client_beatmap_md5,b.md5) score_client_checksum FROM scores s JOIN beatmaps b ON b.id=s.beatmap_id WHERE s.id=$1 FOR SHARE OF s")
             .bind(score)
             .fetch_optional(&mut *tx)
             .await?
             .ok_or(invalid("score_ingestion_link_mismatch"))?;
-        validate_score(&saved, uid, row.get("beatmap_id"), token, payload, input)?;
+        validate_score(
+            &saved,
+            uid,
+            row.get("beatmap_id"),
+            token,
+            payload,
+            input,
+            &row.get::<String, _>("client_checksum"),
+        )?;
         tx.commit().await?;
         return Ok(Preflight::Done(score));
     }
@@ -160,6 +168,7 @@ fn validate_score(
     token: i64,
     payload: &Value,
     input: &SoloScoreSubmission,
+    client_checksum: &str,
 ) -> Result<(), ApiError> {
     let mods = crate::lazer::legacy_mods(input.ruleset_id, &input.mods)?;
     let variant = ScoreVariant::from_legacy(input.ruleset_id, mods)
@@ -169,6 +178,7 @@ fn validate_score(
         || saved.get::<i16, _>("mode") != i16::from(input.ruleset_id)
         || saved.get::<String, _>("score_variant") != variant.as_str()
         || saved.get::<String, _>("client") != "lazer"
+        || saved.get::<String, _>("score_client_checksum") != client_checksum
         || saved.get::<Option<String>, _>("ingestion_key").as_deref()
             != Some(format!("lazer:{token}").as_str())
         || saved.get::<Option<Value>, _>("native_submission").as_ref() != Some(payload)
@@ -213,12 +223,12 @@ async fn process(
         .map_err(|_| invalid("invalid_stored_submission"))?;
     input.validate()?;
     let mods = crate::lazer::legacy_mods(input.ruleset_id, &input.mods)?;
-    let map: i64 = sqlx::query_scalar("SELECT beatmap_id FROM lazer_score_tokens WHERE id=$1 AND user_id=$2 AND scope='solo' AND submission=$3 AND processing_status='received' AND revoked_at IS NULL")
+    let (map, client_checksum): (i64, String) = sqlx::query_as("SELECT t.beatmap_id,COALESCE(t.client_beatmap_md5,b.md5) FROM lazer_score_tokens t JOIN beatmaps b ON b.id=t.beatmap_id WHERE t.id=$1 AND t.user_id=$2 AND t.scope='solo' AND t.submission=$3 AND t.processing_status='received' AND t.revoked_at IS NULL")
         .bind(token).bind(uid).bind(payload).fetch_optional(&state.pool).await?
         .ok_or(invalid("invalid_score_token"))?;
     let response = state.http.post(format!("{}/api/v1/internal/scores", state.sanctuary_url.trim_end_matches('/')))
         .header("x-illya-service-key", state.service_key.as_str())
-        .json(&json!({"user_id":uid,"beatmap_id":map,"mode":input.ruleset_id,"score":input.total_score,
+        .json(&json!({"user_id":uid,"beatmap_id":map,"client_beatmap_md5":client_checksum,"mode":input.ruleset_id,"score":input.total_score,
             "accuracy":input.accuracy*100.0,"max_combo":input.max_combo,"mods":mods,"api_mods":input.mods,
             "passed":input.passed,"hit_counts":input.legacy_hit_counts(),"native_submission":input,
             "client":"lazer","ingestion_key":format!("lazer:{token}")}))
@@ -266,7 +276,7 @@ async fn process(
             "invalid_originating_session",
         ));
     }
-    let saved = sqlx::query("SELECT * FROM scores WHERE id=$1 FOR SHARE")
+    let saved = sqlx::query("SELECT s.*,COALESCE(s.client_beatmap_md5,b.md5) score_client_checksum FROM scores s JOIN beatmaps b ON b.id=s.beatmap_id WHERE s.id=$1 FOR SHARE OF s")
         .bind(score_id)
         .fetch_optional(&mut *tx)
         .await?
@@ -274,7 +284,7 @@ async fn process(
             StatusCode::BAD_GATEWAY,
             "invalid_ingestion_response",
         ))?;
-    validate_score(&saved, uid, map, token, payload, &input)?;
+    validate_score(&saved, uid, map, token, payload, &input, &client_checksum)?;
     sqlx::query("UPDATE lazer_score_tokens SET consumed_at=COALESCE(consumed_at,now()),score_id=$2,processing_status='processed',processing_error=NULL WHERE id=$1")
         .bind(token).bind(score_id).execute(&mut *tx).await?;
     tx.commit().await?;
@@ -433,7 +443,7 @@ pub(crate) async fn processed_score_id(
     uid: i64,
     token: i64,
 ) -> Result<Option<i64>, ApiError> {
-    let Some(row) = sqlx::query("SELECT s.*,t.submission intent,t.submission_sha256 FROM lazer_score_tokens t JOIN users u ON u.id=t.user_id JOIN scores s ON s.id=t.score_id AND s.user_id=t.user_id AND s.beatmap_id=t.beatmap_id AND s.mode=t.ruleset_id AND s.client='lazer' AND s.ingestion_key='lazer:'||t.id::text WHERE t.id=$1 AND t.user_id=$2 AND t.scope='solo' AND t.processing_status='processed' AND t.revoked_at IS NULL AND t.consumed_at IS NOT NULL AND NOT u.is_restricted AND s.verification<>'rejected'")
+    let Some(row) = sqlx::query("SELECT s.*,t.submission intent,t.submission_sha256,COALESCE(t.client_beatmap_md5,b.md5) client_checksum,COALESCE(s.client_beatmap_md5,b.md5) score_client_checksum FROM lazer_score_tokens t JOIN users u ON u.id=t.user_id JOIN scores s ON s.id=t.score_id AND s.user_id=t.user_id AND s.beatmap_id=t.beatmap_id AND s.mode=t.ruleset_id AND s.client='lazer' AND s.ingestion_key='lazer:'||t.id::text JOIN beatmaps b ON b.id=t.beatmap_id WHERE t.id=$1 AND t.user_id=$2 AND t.scope='solo' AND t.processing_status='processed' AND t.revoked_at IS NULL AND t.consumed_at IS NOT NULL AND NOT u.is_restricted AND s.verification<>'rejected'")
         .bind(token).bind(uid).fetch_optional(&state.pool).await? else { return Ok(None); };
     let Some(payload) = row.get::<Option<Value>, _>("intent") else {
         return Ok(None);
@@ -444,7 +454,16 @@ pub(crate) async fn processed_score_id(
     if input.validate().is_err()
         || row.get::<Option<String>, _>("submission_sha256").as_deref()
             != Some(digest(&payload)?.as_str())
-        || validate_score(&row, uid, row.get("beatmap_id"), token, &payload, &input).is_err()
+        || validate_score(
+            &row,
+            uid,
+            row.get("beatmap_id"),
+            token,
+            &payload,
+            &input,
+            &row.get::<String, _>("client_checksum"),
+        )
+        .is_err()
     {
         return Ok(None);
     }
@@ -454,6 +473,37 @@ pub(crate) async fn processed_score_id(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::native_maps::checksum_tests::{DERIVED, Fixture, ORIGINAL};
+    use futures_util::FutureExt;
+
+    #[tokio::test]
+    #[ignore = "requires ILLYA_TEST_DATABASE_URL pointing at disposable local PostgreSQL"]
+    async fn native_checksum_solo_receipt_rejects_a_different_valid_alias() {
+        let fixture = Fixture::new().await;
+        let result = std::panic::AssertUnwindSafe(async {
+            let input: SoloScoreSubmission = serde_json::from_value(json!({
+                "ruleset_id":0,"passed":true,"total_score":1000,"accuracy":1.0,
+                "max_combo":10,"rank":"X","mods":[],"statistics":{"great":10},
+                "maximum_statistics":{"great":10}
+            })).unwrap();
+            let payload = json!(input);
+            for (index, admitted) in [None, Some(ORIGINAL), Some(DERIVED)].into_iter().enumerate() {
+                let token = 40 + index as i64;
+                let id: i64 = sqlx::query_scalar("INSERT INTO scores(user_id,beatmap_id,mode,score,accuracy,max_combo,mods,pp,passed,hit_counts,client,ingestion_key,client_beatmap_md5,native_submission,api_mods) VALUES($1,$2,0,1000,100,10,0,0,true,$3,'lazer',$4,$5,$6,'[]') RETURNING id")
+                    .bind(fixture.user).bind(fixture.map).bind(input.legacy_hit_counts()).bind(format!("lazer:{token}")).bind(admitted).bind(&payload).fetch_one(&fixture.state.pool).await.unwrap();
+                let saved = sqlx::query("SELECT s.*,COALESCE(s.client_beatmap_md5,b.md5) score_client_checksum FROM scores s JOIN beatmaps b ON b.id=s.beatmap_id WHERE s.id=$1")
+                    .bind(id).fetch_one(&fixture.state.pool).await.unwrap();
+                let expected = admitted.unwrap_or(ORIGINAL);
+                validate_score(&saved, fixture.user, fixture.map, token, &payload, &input, expected).unwrap();
+                let substituted = if expected == DERIVED { ORIGINAL } else { DERIVED };
+                assert_eq!(validate_score(&saved, fixture.user, fixture.map, token, &payload, &input, substituted).unwrap_err().1, "score_ingestion_link_mismatch");
+            }
+        }).catch_unwind().await;
+        fixture.cleanup().await;
+        if let Err(error) = result {
+            std::panic::resume_unwind(error);
+        }
+    }
 
     #[test]
     fn transient_ingestion_is_retryable_without_reclassifying_validation() {

@@ -149,9 +149,10 @@ const RESULTS_CTE: &str = "WITH attempts AS (SELECT t.user_id,t.playlist_item_id
     FROM lazer_score_tokens t \
     JOIN lazer_room_rounds r ON r.id=t.round_id AND r.room_id=t.room_id AND r.playlist_item_id=t.playlist_item_id \
     JOIN lazer_room_round_participants p ON p.round_id=r.id AND p.user_id=t.user_id AND p.beatmap_id=t.beatmap_id AND p.ruleset_id=t.ruleset_id \
+    JOIN beatmaps b ON b.id=t.beatmap_id \
     JOIN users u ON u.id=t.user_id AND NOT u.is_restricted \
     JOIN users v ON v.id=$3 AND NOT v.is_restricted \
-    LEFT JOIN scores s ON s.id=t.score_id AND s.user_id=t.user_id AND s.beatmap_id=p.beatmap_id AND s.mode=p.ruleset_id AND s.client='lazer' AND s.ingestion_key='lazer:'||t.id::text AND s.verification<>'rejected' AND t.processing_status='processed' AND t.revoked_at IS NULL AND s.score>=0 AND s.accuracy BETWEEN 0 AND 100 \
+    LEFT JOIN scores s ON s.id=t.score_id AND s.user_id=t.user_id AND s.beatmap_id=p.beatmap_id AND s.mode=p.ruleset_id AND s.client='lazer' AND s.ingestion_key='lazer:'||t.id::text AND s.verification<>'rejected' AND t.processing_status='processed' AND t.revoked_at IS NULL AND s.score>=0 AND s.accuracy BETWEEN 0 AND 100 AND illya_beatmap_checksum_matches(b.id,p.beatmap_checksum) AND lower(COALESCE(t.client_beatmap_md5,b.md5))=lower(p.beatmap_checksum) AND lower(COALESCE(s.client_beatmap_md5,b.md5))=lower(p.beatmap_checksum) \
     WHERE t.scope='room' AND t.room_id=$1 AND ($2::bigint IS NULL OR t.playlist_item_id=$2) \
     AND ($4 OR t.user_id=$3 OR EXISTS(SELECT 1 FROM lazer_room_round_participants vp WHERE vp.round_id=r.id AND vp.user_id=$3)) \
     ), highs AS (SELECT DISTINCT ON(user_id,playlist_item_id) user_id,playlist_item_id,score_id,total_score,accuracy,passed \
@@ -387,6 +388,7 @@ const SCORE_SQL: &str = "SELECT s.*,b.native_id native_map_id,b.status map_statu
     JOIN users u ON u.id=s.user_id AND NOT u.is_restricted \
     JOIN users v ON v.id=$4 AND NOT v.is_restricted \
     WHERE t.scope='room' AND t.processing_status='processed' AND t.revoked_at IS NULL AND t.room_id=$1 AND t.playlist_item_id=$2 \
+    AND illya_beatmap_checksum_matches(b.id,p.beatmap_checksum) AND lower(COALESCE(t.client_beatmap_md5,b.md5))=lower(p.beatmap_checksum) AND lower(COALESCE(s.client_beatmap_md5,b.md5))=lower(p.beatmap_checksum) \
     AND (($6 AND t.id=$3 AND t.user_id=$4) OR (NOT $6 AND s.id=$3)) \
     AND ($5 OR s.user_id=$4 OR EXISTS(SELECT 1 FROM lazer_room_round_participants vp WHERE vp.round_id=r.id AND vp.user_id=$4)) \
     AND (s.verification<>'rejected' OR s.user_id=$4 OR $5)";
@@ -916,7 +918,7 @@ pub(crate) async fn new_best_rank(
 ) -> Result<Option<i32>, ApiError> {
     let rank = sqlx::query_scalar::<_, i64>(
         "WITH target AS (SELECT t.room_id,t.playlist_item_id,t.score_id,r.settings FROM lazer_score_tokens t JOIN lazer_rooms r ON r.id=t.room_id WHERE t.id=$1 AND t.scope='room' AND t.processing_status='processed' AND t.revoked_at IS NULL), \
-        eligible AS (SELECT s.id,s.user_id,s.score FROM target x JOIN lazer_score_tokens t ON t.room_id=x.room_id AND t.playlist_item_id=x.playlist_item_id AND t.scope='room' AND t.processing_status='processed' AND t.revoked_at IS NULL JOIN lazer_room_rounds rr ON rr.id=t.round_id AND rr.room_id=t.room_id AND rr.playlist_item_id=t.playlist_item_id JOIN lazer_room_round_participants p ON p.round_id=rr.id AND p.user_id=t.user_id AND p.beatmap_id=t.beatmap_id AND p.ruleset_id=t.ruleset_id JOIN scores s ON s.id=t.score_id AND s.user_id=t.user_id AND s.beatmap_id=p.beatmap_id AND s.mode=p.ruleset_id AND s.client='lazer' AND s.ingestion_key='lazer:'||t.id::text JOIN users u ON u.id=s.user_id AND NOT u.is_restricted WHERE s.verification<>'rejected' AND (x.settings->>'matchType' IN ('1','head_to_head') OR s.passed)), \
+        eligible AS (SELECT s.id,s.user_id,s.score FROM target x JOIN lazer_score_tokens t ON t.room_id=x.room_id AND t.playlist_item_id=x.playlist_item_id AND t.scope='room' AND t.processing_status='processed' AND t.revoked_at IS NULL JOIN lazer_room_rounds rr ON rr.id=t.round_id AND rr.room_id=t.room_id AND rr.playlist_item_id=t.playlist_item_id JOIN lazer_room_round_participants p ON p.round_id=rr.id AND p.user_id=t.user_id AND p.beatmap_id=t.beatmap_id AND p.ruleset_id=t.ruleset_id JOIN beatmaps b ON b.id=t.beatmap_id JOIN scores s ON s.id=t.score_id AND s.user_id=t.user_id AND s.beatmap_id=p.beatmap_id AND s.mode=p.ruleset_id AND s.client='lazer' AND s.ingestion_key='lazer:'||t.id::text JOIN users u ON u.id=s.user_id AND NOT u.is_restricted WHERE illya_beatmap_checksum_matches(b.id,p.beatmap_checksum) AND lower(COALESCE(t.client_beatmap_md5,b.md5))=lower(p.beatmap_checksum) AND lower(COALESCE(s.client_beatmap_md5,b.md5))=lower(p.beatmap_checksum) AND s.verification<>'rejected' AND (x.settings->>'matchType' IN ('1','head_to_head') OR s.passed)), \
         highs AS (SELECT DISTINCT ON(user_id) id,user_id,score FROM eligible ORDER BY user_id,score DESC,id), \
         ranked AS (SELECT id,row_number() OVER(ORDER BY score DESC,id) position FROM highs) \
         SELECT position FROM ranked WHERE id=(SELECT score_id FROM target)",

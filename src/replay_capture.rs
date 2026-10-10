@@ -14,6 +14,10 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 #[path = "replay_capture_tests.rs"]
 mod tests;
 
+#[cfg(test)]
+#[path = "replay_checksum_tests.rs"]
+mod checksum_tests;
+
 fn error(code: &'static str) -> ApiError {
     ApiError(StatusCode::BAD_REQUEST, code)
 }
@@ -63,7 +67,7 @@ async fn room_capture_guard(
     {
         return Err(error("room_score_token_revoked"));
     }
-    let context = sqlx::query("SELECT p.mods,p.beatmap_id,p.ruleset_id,p.beatmap_checksum,r.status,r.expires_at,lr.current_round_id,lr.state room_state,m.state member_state,b.md5 FROM lazer_room_round_participants p JOIN lazer_room_rounds r ON r.id=p.round_id JOIN lazer_rooms lr ON lr.id=r.room_id JOIN beatmaps b ON b.id=p.beatmap_id JOIN users u ON u.id=p.user_id LEFT JOIN lazer_room_members m ON m.room_id=r.room_id AND m.user_id=p.user_id WHERE p.round_id=$1 AND p.user_id=$2 AND r.room_id=$3 AND r.playlist_item_id=$4 AND p.aborted_at IS NULL AND r.status<>'aborted' AND NOT u.is_restricted")
+    let context = sqlx::query("SELECT p.mods,p.beatmap_id,p.ruleset_id,p.beatmap_checksum,r.status,r.expires_at,lr.current_round_id,lr.state room_state,m.state member_state,illya_beatmap_checksum_matches(p.beatmap_id,lower(p.beatmap_checksum)) checksum_registered FROM lazer_room_round_participants p JOIN lazer_room_rounds r ON r.id=p.round_id JOIN lazer_rooms lr ON lr.id=r.room_id JOIN beatmaps b ON b.id=p.beatmap_id JOIN users u ON u.id=p.user_id LEFT JOIN lazer_room_members m ON m.room_id=r.room_id AND m.user_id=p.user_id WHERE p.round_id=$1 AND p.user_id=$2 AND r.room_id=$3 AND r.playlist_item_id=$4 AND p.aborted_at IS NULL AND r.status<>'aborted' AND NOT u.is_restricted")
         .bind(row.get::<i64, _>("round_id")).bind(row.get::<i64, _>("user_id"))
         .bind(row.get::<i64, _>("room_id")).bind(row.get::<i64, _>("playlist_item_id"))
         .fetch_optional(&mut **tx).await?.ok_or(error("invalid_room_score_token"))?;
@@ -71,7 +75,8 @@ async fn room_capture_guard(
         || context.get::<i16, _>("ruleset_id") != row.get::<i16, _>("ruleset_id")
         || !context
             .get::<String, _>("beatmap_checksum")
-            .eq_ignore_ascii_case(&context.get::<String, _>("md5"))
+            .eq_ignore_ascii_case(&row.get::<String, _>("token_beatmap_md5"))
+        || !context.get::<bool, _>("checksum_registered")
     {
         return Err(error("score_token_beatmap_mismatch"));
     }
@@ -107,7 +112,7 @@ async fn capture_token(
     token: i64,
     consumed: bool,
 ) -> Result<PgRow, ApiError> {
-    sqlx::query("SELECT t.*,b.native_id FROM lazer_score_tokens t JOIN beatmaps b ON b.id=t.beatmap_id JOIN users u ON u.id=t.user_id WHERE t.id=$1 AND t.user_id=$2 AND NOT u.is_restricted AND (t.expires_at>clock_timestamp() OR ($3 AND t.score_id IS NOT NULL)) FOR UPDATE OF t")
+    sqlx::query("SELECT t.*,b.native_id,COALESCE(t.client_beatmap_md5,b.md5) token_beatmap_md5 FROM lazer_score_tokens t JOIN beatmaps b ON b.id=t.beatmap_id JOIN users u ON u.id=t.user_id WHERE t.id=$1 AND t.user_id=$2 AND NOT u.is_restricted AND (t.expires_at>clock_timestamp() OR ($3 AND t.score_id IS NOT NULL)) FOR UPDATE OF t")
         .bind(token).bind(uid).bind(consumed).fetch_optional(&mut **tx).await?
         .ok_or(error("invalid_score_token"))
 }
@@ -343,7 +348,7 @@ pub async fn finalize(state: &AppState, uid: i64, token: i64) -> Result<Option<i
     {
         return Ok(None);
     }
-    let Some(row)=sqlx::query("SELECT s.native_submission submission,s.id,s.mode,s.mods,s.score,s.accuracy,s.max_combo,s.passed,s.hit_counts,s.api_mods,s.replay_path,s.replay_sha256,s.replay_format,s.replay_complete,s.created_at,s.verification,b.md5,u.username FROM lazer_score_tokens t JOIN scores s ON s.id=t.score_id JOIN beatmaps b ON b.id=t.beatmap_id JOIN users u ON u.id=t.user_id WHERE t.id=$1 AND t.user_id=$2 AND s.user_id=$2 AND s.beatmap_id=t.beatmap_id AND s.client='lazer' AND s.mode=t.ruleset_id AND s.ingestion_key='lazer:'||t.id::text AND NOT u.is_restricted FOR UPDATE OF s").bind(token).bind(uid).fetch_optional(&mut *tx).await? else { return Ok(None); };
+    let Some(row)=sqlx::query("SELECT s.native_submission submission,s.id,s.mode,s.mods,s.score,s.accuracy,s.max_combo,s.passed,s.hit_counts,s.api_mods,s.replay_path,s.replay_sha256,s.replay_format,s.replay_complete,s.created_at,s.verification,COALESCE(s.client_beatmap_md5,b.md5) replay_beatmap_md5,u.username FROM lazer_score_tokens t JOIN scores s ON s.id=t.score_id JOIN beatmaps b ON b.id=t.beatmap_id JOIN users u ON u.id=t.user_id WHERE t.id=$1 AND t.user_id=$2 AND s.user_id=$2 AND s.beatmap_id=t.beatmap_id AND s.client='lazer' AND s.mode=t.ruleset_id AND s.ingestion_key='lazer:'||t.id::text AND NOT u.is_restricted FOR UPDATE OF s").bind(token).bind(uid).fetch_optional(&mut *tx).await? else { return Ok(None); };
     let score_id: i64 = row.get("id");
     // A delayed capture must never undo a moderator's rejection. The locked
     // score row also serializes this check with moderation during publication.
@@ -362,7 +367,11 @@ pub async fn finalize(state: &AppState, uid: i64, token: i64) -> Result<Option<i
     )
     .map_err(|_| error("invalid_stored_submission"))?;
     input.validate()?;
-    if json!(saved) != json!(input)
+    let frozen_checksum: String = token_row.get("token_beatmap_md5");
+    if !row
+        .get::<String, _>("replay_beatmap_md5")
+        .eq_ignore_ascii_case(&frozen_checksum)
+        || json!(saved) != json!(input)
         || i16::from(input.ruleset_id) != row.get::<i16, _>("mode")
         || i64::from(crate::lazer::legacy_mods(input.ruleset_id, &input.mods)?)
             != row.get::<i64, _>("mods")
@@ -411,7 +420,7 @@ pub async fn finalize(state: &AppState, uid: i64, token: i64) -> Result<Option<i
         return Err(error("replay_metadata_mismatch"));
     }
     let username: String = row.get("username");
-    let md5: String = row.get("md5");
+    let md5: String = row.get("replay_beatmap_md5");
     let date: chrono::DateTime<chrono::Utc> = row.get("created_at");
     let bits = row.get::<i64, _>("mods") as u32;
     let timestamp_ticks = date.timestamp() * 10_000_000
@@ -470,6 +479,7 @@ pub async fn finalize(state: &AppState, uid: i64, token: i64) -> Result<Option<i
                 uid,
                 crate::native_score_publication::NativeClient::Lazer,
                 &ingestion_key,
+                &frozen_checksum,
             )
             .await?;
         }
@@ -550,7 +560,7 @@ pub async fn finalize(state: &AppState, uid: i64, token: i64) -> Result<Option<i
             crate::native_score_publication::publish(
                 &mut tx, score_id, uid,
                 crate::native_score_publication::NativeClient::Lazer,
-                &ingestion_key,
+                &ingestion_key, &frozen_checksum,
             ).await?;
         }
         tx.commit().await?;

@@ -13,6 +13,7 @@ mod native_chat;
 #[cfg(test)]
 mod native_map_tests;
 mod native_maps;
+mod native_media;
 mod native_score_publication;
 mod native_set_metadata;
 #[cfg(test)]
@@ -139,6 +140,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .merge(signalr::router())
         .merge(beatmaps::router())
         .merge(assets::router())
+        .merge(native_media::router())
         .layer(DefaultBodyLimit::max(4_194_304))
         .layer(TraceLayer::new_for_http().make_span_with(|request: &axum::http::Request<axum::body::Body>| tracing::info_span!("http_request", method=%request.method(), path=%request.uri().path())))
         .with_state(state);

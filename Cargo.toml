@@ -25,7 +25,10 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 futures-util = "0.3"
 tokio-stream = { version = "0.1", features = ["sync"] }
-image = { version = "0.25", default-features = false, features = ["png", "webp"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
+zip = { version = "2", default-features = false, features = ["deflate"] }
+encoding_rs = "0.8"
+crc32fast = "1"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

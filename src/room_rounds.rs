@@ -147,11 +147,19 @@ pub(crate) async fn freeze_round(
         .fetch_optional(&mut **tx)
         .await?
         .ok_or_else(|| invalid("beatmap_not_found"))?;
-    let checksum: String = map.get("md5");
     crate::native_maps::lock_active_set(tx, map.get("native_set_id")).await?;
-    if snapshot["beatmapChecksum"] != checksum {
-        return Err(invalid("beatmap_checksum_mismatch"));
-    }
+    let checksum = snapshot["beatmapChecksum"]
+        .as_str()
+        .ok_or_else(|| invalid("beatmap_checksum_mismatch"))?;
+    crate::native_maps::require_checksum(&mut **tx, map.get("id"), checksum)
+        .await
+        .map_err(|error| {
+            if error.0 == StatusCode::BAD_REQUEST {
+                invalid("beatmap_checksum_mismatch")
+            } else {
+                error
+            }
+        })?;
     let version = sqlx::query("SELECT id,snapshot FROM lazer_room_playlist_versions WHERE room_id=$1 AND playlist_item_id=$2 ORDER BY id DESC LIMIT 1")
         .bind(room_id).bind(item).fetch_optional(&mut **tx).await?;
     let version_id =
@@ -182,7 +190,7 @@ pub(crate) async fn freeze_round(
         }
         crate::native_maps::require_id(selected_map)?;
         let actual =
-            sqlx::query("SELECT id,md5,mode,native_set_id FROM beatmaps WHERE native_id=$1")
+            sqlx::query("SELECT id,md5,mode,native_set_id,illya_beatmap_preferred_checksum(id) preferred_checksum FROM beatmaps WHERE native_id=$1")
                 .bind(selected_map)
                 .fetch_optional(&mut **tx)
                 .await?
@@ -201,8 +209,16 @@ pub(crate) async fn freeze_round(
             snapshot,
             &member.get::<Value, _>("mods"),
         )?;
+        // A retained playlist is immutable. Starting it again preserves its
+        // exact registered client bytes; newly selected freestyle siblings use
+        // their current published distribution checksum.
+        let participant_checksum = if same_map {
+            checksum.to_ascii_lowercase()
+        } else {
+            actual.get::<String, _>("preferred_checksum")
+        };
         sqlx::query("INSERT INTO lazer_room_round_participants(round_id,user_id,beatmap_id,beatmap_checksum,ruleset_id,mods) VALUES($1,$2,$3,$4,$5,$6)")
-            .bind(round_id).bind(user).bind(actual.get::<i64,_>("id")).bind(actual.get::<String,_>("md5")).bind(selected_mode).bind(mods).execute(&mut **tx).await?;
+            .bind(round_id).bind(user).bind(actual.get::<i64,_>("id")).bind(participant_checksum).bind(selected_mode).bind(mods).execute(&mut **tx).await?;
     }
     sqlx::query("UPDATE lazer_rooms SET current_round_id=$2 WHERE id=$1")
         .bind(room_id)

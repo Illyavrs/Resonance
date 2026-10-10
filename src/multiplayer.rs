@@ -198,7 +198,7 @@ async fn active_match_map(db: &mut PgConnection, m: &room::Match) -> Result<(), 
     if m.map_md5.is_empty() && m.map_id <= 0 {
         return Ok(());
     }
-    let maps = sqlx::query("SELECT native_id,native_set_id,mode,md5 FROM beatmaps WHERE md5=$1 OR native_id=$2 ORDER BY id LIMIT 2")
+    let maps = sqlx::query("SELECT b.native_id,b.native_set_id,b.mode,illya_beatmap_checksum_matches(b.id,$1) checksum_matches FROM beatmaps b WHERE EXISTS(SELECT 1 FROM beatmap_checksum_identities h WHERE h.beatmap_id=b.id AND h.md5=$1) OR b.native_id=$2 ORDER BY b.id LIMIT 2")
         .bind(m.map_md5.to_ascii_lowercase())
         .bind(i64::from(m.map_id))
         .fetch_all(&mut *db)
@@ -209,7 +209,7 @@ async fn active_match_map(db: &mut PgConnection, m: &room::Match) -> Result<(), 
     crate::native_maps::lock_active_set(db, map.get("native_set_id")).await?;
     if maps.len() != 1
         || i64::from(m.map_id) != map.get::<i64, _>("native_id")
-        || !m.map_md5.eq_ignore_ascii_case(&map.get::<String, _>("md5"))
+        || !map.get::<bool, _>("checksum_matches")
     {
         return Err(ApiError(StatusCode::BAD_REQUEST, "beatmap_id_mismatch"));
     }

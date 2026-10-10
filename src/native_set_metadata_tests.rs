@@ -365,6 +365,7 @@ impl Fixture {
         let base = format!("http://{}", listener.local_addr().unwrap());
         let router = lazer::router()
             .merge(beatmaps::router())
+            .merge(crate::native_media::router())
             .with_state(state.clone());
         let gateway_task = tokio::spawn(async move {
             axum::serve(listener, router).await.unwrap();
@@ -522,6 +523,106 @@ macro_rules! fixture_test {
 }
 
 fixture_test!(
+    native_media_public_local_routes_preserve_bytes_and_enforce_withdrawal_on_cached_audio,
+    f,
+    {
+        use sha2::Digest;
+        use std::io::{Cursor, Write};
+        let chart = b"osu file format v14\n[General]\nAudioFilename: preview.mp3\n[Events]\n0,0,\"background.png\",0,0\n";
+        let preview = b"ID3-original-local-preview";
+        let mut image = Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+            24,
+            12,
+            image::Rgb([12, 22, 32]),
+        ))
+        .write_to(&mut image, image::ImageFormat::Png)
+        .unwrap();
+        let cover = image.into_inner();
+        let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        for (name, content) in [
+            ("fixture.osu", chart.as_slice()),
+            ("preview.mp3", preview.as_slice()),
+            ("background.png", cover.as_slice()),
+        ] {
+            writer.start_file(name, options).unwrap();
+            writer.write_all(content).unwrap();
+        }
+        let archive = writer.finish().unwrap().into_inner();
+        tokio::fs::write(f.storage.join("maps/media-fixture.osz"), &archive)
+            .await
+            .unwrap();
+        tokio::fs::write(f.storage.join("maps/fixture.osu"), chart)
+            .await
+            .unwrap();
+        let set = crate::native_maps::LOCAL_ID_MIN
+            + (uuid::Uuid::new_v4().as_u128() % 100_000_000) as i64;
+        let hash = format!("{:x}", md5::compute(chart));
+        let package: uuid::Uuid = sqlx::query_scalar("INSERT INTO beatmap_packages(native_set_id,kind,sha256,byte_length,member_md5,archive_path) VALUES($1,'osz',$2,$3,$4,'media-fixture.osz') RETURNING id")
+            .bind(set).bind(format!("{:x}",sha2::Sha256::digest(&archive))).bind(archive.len() as i64).bind(vec![hash.clone()])
+            .fetch_one(&f.state.pool).await.unwrap();
+        sqlx::query("INSERT INTO beatmaps(local_package_id,title,artist,creator,version,mode,status,stars,md5,osu_path,archive_path) VALUES($1,'Local media fixture','Fixture','Fixture','Normal',0,'graveyard',1,$2,'fixture.osu','media-fixture.osz')")
+            .bind(package).bind(hash).execute(&f.state.pool).await.unwrap();
+        let before = f.snapshot().await;
+        let cover_response = f
+            .request(&format!("/api/v2/beatmapsets/{set}/media/card@2x"), false)
+            .await;
+        assert_eq!(cover_response.status(), StatusCode::OK);
+        assert_eq!(cover_response.headers()["content-type"], "image/png");
+        assert_eq!(cover_response.bytes().await.unwrap().as_ref(), cover);
+        let preview_path = format!("/api/v2/beatmapsets/{set}/preview");
+        let audio = f.request(&preview_path, false).await;
+        assert_eq!(audio.status(), StatusCode::OK);
+        assert_eq!(audio.headers()["content-type"], "audio/mpeg");
+        let etag = audio.headers()["etag"].clone();
+        assert_eq!(audio.bytes().await.unwrap().as_ref(), preview);
+        let conditional = f
+            .state
+            .http
+            .get(format!("{}{preview_path}", f.base))
+            .header("if-none-match", etag.clone())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(conditional.status(), StatusCode::NOT_MODIFIED);
+        assert!(conditional.bytes().await.unwrap().is_empty());
+        assert_eq!(f.snapshot().await, before);
+        assert!(f.backend.calls.lock().await.is_empty());
+        assert!(f.backend.resolve_calls.lock().await.is_empty());
+        sqlx::query("INSERT INTO beatmapset_availability(native_set_id,withdrawn,revision,reason,actor_id) VALUES($1,true,1,'Original media withdrawal fixture',$2)")
+            .bind(set).bind(f.user).execute(&f.state.pool).await.unwrap();
+        for path in [
+            preview_path,
+            format!("/api/v2/beatmapsets/{set}/media/cover"),
+        ] {
+            let response = f
+                .state
+                .http
+                .get(format!("{}{path}", f.base))
+                .header("if-none-match", etag.clone())
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::GONE);
+        }
+        let unknown = f
+            .request(&format!("/api/v2/beatmapsets/{}/preview", i32::MAX), false)
+            .await;
+        assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
+        let invalid = f
+            .request(
+                &format!("/api/v2/beatmapsets/{set}/media/../../../secret"),
+                false,
+            )
+            .await;
+        assert_eq!(invalid.status(), StatusCode::NOT_FOUND);
+        assert_eq!(f.snapshot().await, before);
+    }
+);
+
+fixture_test!(
     native_set_metadata_requires_auth_and_valid_ids_before_service_access,
     f,
     {
@@ -582,14 +683,18 @@ fixture_test!(
         assert_eq!(value["user_id"], 0);
         assert_eq!(value["download_disabled"], true);
         assert_eq!(value["availability"]["download_disabled"], true);
-        assert_eq!(value["preview_url"], "");
         assert!(
-            value["covers"]
-                .as_object()
+            value["preview_url"]
+                .as_str()
                 .unwrap()
-                .values()
-                .all(|value| value == "")
+                .ends_with(&format!("/api/v2/beatmapsets/{SET}/preview"))
         );
+        assert!(value["covers"].as_object().unwrap().values().all(|value| {
+            value
+                .as_str()
+                .unwrap()
+                .contains(&format!("/api/v2/beatmapsets/{SET}/media/"))
+        }));
         let maps = value["beatmaps"].as_array().unwrap();
         assert_eq!(maps.len(), 4);
         for (index, map) in maps.iter().enumerate() {

@@ -52,7 +52,10 @@ fn native_server_routing_is_explicit_and_official_selection_escapes_prefix() {
         let (source, query) = routed(raw);
         assert_eq!(source, SearchSource::Server, "{raw}");
         assert_eq!(query["q"], "ordinary", "{raw}");
-        assert!(!query.contains_key("source"));
+        assert_eq!(
+            query.get("source").map(String::as_str),
+            raw.starts_with("source=local").then_some("local")
+        );
     }
     assert_eq!(routed("q=server%3A").1["q"], "");
     let (source, query) = routed("source=official&q=++server%3A+ordinary++");
@@ -274,10 +277,28 @@ async fn native_server_search_routes_unicode_metadata_and_cursor_without_imports
     let f = Fixture::new().await;
     let check = std::panic::AssertUnwindSafe(async {
         *f.backend.server_reply.lock().await = (StatusCode::OK, result().to_string().into_bytes());
+        // The API preserves the complete catalogue payload while replacing
+        // public media with resources on this deployment's own origin.
+        let configured = std::env::var("PUBLIC_ORIGIN")
+            .unwrap_or_else(|_| "http://localhost:3000".into());
+        let origin = reqwest::Url::parse(&configured).unwrap().origin().ascii_serialization();
+        let mut expected = result();
+        expected["beatmapsets"][0]["covers"] = json!({
+            "cover":format!("{origin}/api/v2/beatmapsets/820001/media/cover"),
+            "cover@2x":format!("{origin}/api/v2/beatmapsets/820001/media/cover@2x"),
+            "card":format!("{origin}/api/v2/beatmapsets/820001/media/card"),
+            "card@2x":format!("{origin}/api/v2/beatmapsets/820001/media/card@2x"),
+            "list":format!("{origin}/api/v2/beatmapsets/820001/media/list"),
+            "list@2x":format!("{origin}/api/v2/beatmapsets/820001/media/list@2x"),
+            "slimcover":format!("{origin}/api/v2/beatmapsets/820001/media/slimcover"),
+            "slimcover@2x":format!("{origin}/api/v2/beatmapsets/820001/media/slimcover@2x")
+        });
+        expected["beatmapsets"][0]["preview_url"] =
+            json!(format!("{origin}/api/v2/beatmapsets/820001/preview"));
         assert_eq!(f.get("q=server%3A", false).await.0, StatusCode::UNAUTHORIZED);
         assert!(f.backend.server_calls.lock().await.is_empty());
         let query = "q=++server%3A+%E6%98%9F+%26+100%25++&m=3&s=ranked&sort=ranked_desc&nsfw=false&g=0&l=0&c=&e=";
-        assert_eq!(f.get(query, true).await, (StatusCode::OK, result()));
+        assert_eq!(f.get(query, true).await, (StatusCode::OK, expected.clone()));
         let calls = f.backend.server_calls.lock().await;
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0]["user_id"], f.user);
@@ -292,10 +313,11 @@ async fn native_server_search_routes_unicode_metadata_and_cursor_without_imports
                 ("q", "server: 搜尋"),
                 (cursor_key, result()["cursor_string"].as_str().unwrap()),
             ]).unwrap();
-            assert_eq!(f.get(&query, true).await, (StatusCode::OK, result()));
+            assert_eq!(f.get(&query, true).await, (StatusCode::OK, expected.clone()));
             let calls = f.backend.server_calls.lock().await;
             let forwarded: HashMap<String, String> = serde_urlencoded::from_str(calls.last().unwrap()["query"].as_str().unwrap()).unwrap();
             assert_eq!(forwarded["q"], "搜尋");
+            assert_eq!(forwarded["source"], "local");
             assert_eq!(forwarded[cursor_key], result()["cursor_string"].as_str().unwrap());
         }
         assert_eq!(f.get("source=official&q=server%3A%E6%98%9F", true).await.0, StatusCode::OK);

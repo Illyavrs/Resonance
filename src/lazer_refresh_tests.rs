@@ -457,3 +457,6 @@ fixture_test!(password_logins_create_independent_session_uuids, f, {
         .unwrap();
     assert_eq!(count, 3);
 });
+
+#[path = "lazer_session_lifecycle_tests.rs"]
+mod lifecycle;

@@ -226,8 +226,10 @@ pub(crate) async fn retained_map_json(
         }
     };
     let mut output = json!({"id":id,"beatmapset_id":set,"checksum":row.get::<String,_>("md5"),"version":row.get::<String,_>("version"),"mode":(["osu","taiko","fruits","mania"][mode]),"mode_int":mode,"status":status,"ranked":rank,"difficulty_rating":row.get::<f64,_>("stars"),"bpm":row.get::<f64,_>("bpm"),"total_length":row.get::<i32,_>("length_seconds"),"hit_length":row.get::<i32,_>("length_seconds"),"max_combo":row.get::<i32,_>("max_combo"),"user_id":row.get::<Option<i64>,_>("uploaded_by").unwrap_or(0),"is_scoreable":true,"url":format!("/beatmaps/{internal}"),"beatmapset":{"id":set,"artist":row.get::<String,_>("artist"),"artist_unicode":row.get::<String,_>("artist"),"title":row.get::<String,_>("title"),"title_unicode":row.get::<String,_>("title"),"creator":row.get::<String,_>("creator"),"status":status,"user_id":row.get::<Option<i64>,_>("uploaded_by").unwrap_or(0),"covers":{"cover":"","cover@2x":"","card":"","card@2x":"","list":"","list@2x":"","slimcover":"","slimcover@2x":""},"preview_url":"","download_disabled":disabled,"video":false,"storyboard":false,"availability":{"download_disabled":disabled,"more_information":null},"beatmaps":[]}});
+    output["checksum"] = json!(preferred_checksum(state, internal).await?);
     output["is_scoreable"] = json!(active);
     output["beatmapset"]["availability"]["withdrawn"] = json!(!active);
+    crate::native_media::decorate_set(&mut output["beatmapset"])?;
     Ok(output)
 }
 
@@ -341,15 +343,68 @@ pub async fn resolve_checksum(
         ));
     }
     let checksum = checksum.to_ascii_lowercase();
-    if let Some(id) = sqlx::query_scalar("SELECT id FROM beatmaps WHERE md5=$1")
-        .bind(&checksum)
-        .fetch_optional(&state.pool)
-        .await?
-    {
-        require_active_map(&state.pool, id).await?;
+    if let Some(id) = known_checksum(state, &checksum).await? {
         return Ok(Some(id));
     }
     discover(state, user_id, Selector::Checksum(&checksum)).await
+}
+
+/// Originals and server-materialized distributions share one protected MD5
+/// namespace. Only persisted exact bindings may resolve a derivative checksum.
+pub(crate) async fn known_checksum(
+    state: &AppState,
+    checksum: &str,
+) -> Result<Option<i64>, ApiError> {
+    if !is_md5(checksum) {
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            "invalid_beatmap_identity",
+        ));
+    }
+    let known = sqlx::query_scalar::<_, i64>(
+        "SELECT DISTINCT beatmap_id FROM beatmap_checksum_identities WHERE md5=$1",
+    )
+    .bind(checksum.to_ascii_lowercase())
+    .fetch_optional(&state.pool)
+    .await?;
+    if let Some(internal) = known {
+        require_active_map(&state.pool, internal).await?;
+    }
+    Ok(known)
+}
+
+/// Call inside the admission transaction after locking the set. This validates
+/// the exact client bytes without changing the immutable source-map checksum.
+pub(crate) async fn require_checksum<'e>(
+    db: impl sqlx::Executor<'e, Database = sqlx::Postgres>,
+    internal: i64,
+    checksum: &str,
+) -> Result<(), ApiError> {
+    if !is_md5(checksum)
+        || !sqlx::query_scalar::<_, bool>("SELECT illya_beatmap_checksum_matches($1,$2)")
+            .bind(internal)
+            .bind(checksum.to_ascii_lowercase())
+            .fetch_one(db)
+            .await?
+    {
+        return Err(ApiError(StatusCode::BAD_REQUEST, "beatmap_hash_mismatch"));
+    }
+    Ok(())
+}
+
+/// New native discovery prefers the registered local distribution. Historical
+/// scores and tokens carry their own exact checksum instead of consulting this.
+pub(crate) async fn preferred_checksum(
+    state: &AppState,
+    internal: i64,
+) -> Result<String, ApiError> {
+    sqlx::query_scalar(
+        "SELECT COALESCE(m.derived_md5,b.md5) FROM beatmaps b LEFT JOIN local_beatmap_distribution_members m ON m.beatmap_id=b.id WHERE b.id=$1",
+    )
+    .bind(internal)
+    .fetch_optional(&state.pool)
+    .await?
+    .ok_or(ApiError(StatusCode::NOT_FOUND, "beatmap_not_found"))
 }
 
 /// Exact basename aliases are indexed data, never filesystem paths. Multiple
@@ -415,13 +470,15 @@ pub(crate) async fn resolve_checksum_for_id(
     }
     let known = known_id(state, native_id).await?;
     if let Some(internal) = known {
-        let hash: String = sqlx::query_scalar("SELECT md5 FROM beatmaps WHERE id=$1")
-            .bind(internal)
-            .fetch_one(&state.pool)
-            .await?;
-        if !hash.eq_ignore_ascii_case(checksum) {
-            return Err(ApiError(StatusCode::BAD_REQUEST, "beatmap_id_mismatch"));
-        }
+        require_checksum(&state.pool, internal, checksum)
+            .await
+            .map_err(|error| {
+                if error.1 == "beatmap_hash_mismatch" {
+                    ApiError(StatusCode::BAD_REQUEST, "beatmap_id_mismatch")
+                } else {
+                    error
+                }
+            })?;
         return Ok(Some(internal));
     }
     if native_id >= LOCAL_ID_MIN {
@@ -520,7 +577,20 @@ async fn discover(
         .json()
         .await
         .map_err(|_| ApiError(StatusCode::BAD_GATEWAY, "invalid_map_resolution_response"))?;
-    if !identity.valid_for(&selector) {
+    // The service record keeps the immutable source MD5. A requested derived
+    // MD5 must independently identify that exact canonical row; changing the
+    // advertised checksum cannot substitute an official ID or another map.
+    let selector_matches = match &selector {
+        Selector::Checksum(checksum) => {
+            match require_checksum(&state.pool, identity.id, checksum).await {
+                Ok(()) => identity.valid_for(&Selector::Checksum(&identity.md5)),
+                Err(error) if error.1 == "beatmap_hash_mismatch" => false,
+                Err(error) => return Err(error),
+            }
+        }
+        _ => identity.valid_for(&selector),
+    };
+    if !selector_matches {
         return Err(ApiError(
             StatusCode::BAD_GATEWAY,
             "invalid_map_resolution_response",
@@ -549,6 +619,10 @@ async fn discover(
     require_active_map(&state.pool, identity.id).await?;
     Ok(Some(identity.id))
 }
+
+#[cfg(test)]
+#[path = "native_checksum_tests.rs"]
+pub(crate) mod checksum_tests;
 
 #[cfg(test)]
 mod tests {

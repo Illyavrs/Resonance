@@ -110,6 +110,7 @@ pub(crate) async fn local_set_json(state: &AppState, id: i64) -> Result<Value, A
     ))?;
     set["beatmaps"] = json!(maps);
     summarize_local_set(&mut set)?;
+    crate::native_media::decorate_set(&mut set)?;
     crate::native_maps::require_active(&state.pool, id).await?;
     Ok(set)
 }
@@ -273,17 +274,20 @@ async fn download(
     if !crate::native_maps::valid_id(id) {
         return Err(ApiError(StatusCode::BAD_REQUEST, "invalid_beatmapset_id"));
     }
-    let result = crate::native_archives::bytes(&state, id, Some(player.id)).await;
+    let result = crate::native_archives::download(&state, id, Some(player.id)).await;
     common::bearer(&state, &headers).await?;
-    let bytes = result?;
+    let archive = result?;
     Ok((
         [
-            ("content-type", "application/x-osu-beatmap-archive"),
-            ("content-disposition", "attachment; filename=beatmap.osz"),
-            ("cache-control", "private, no-store"),
-            ("x-content-type-options", "nosniff"),
+            (
+                "content-type",
+                "application/x-osu-beatmap-archive".to_owned(),
+            ),
+            ("content-disposition", archive.content_disposition),
+            ("cache-control", "private, no-store".to_owned()),
+            ("x-content-type-options", "nosniff".to_owned()),
         ],
-        bytes,
+        archive.bytes,
     )
         .into_response())
 }
@@ -333,6 +337,11 @@ fn search_route(mut query: HashMap<String, String>) -> Result<(SearchSource, Str
         source.as_deref() == Some("local") || (source.is_none() && reserved_query.is_some());
     if server && let Some(q) = reserved_query {
         query.insert("q".into(), q);
+    }
+    if source.as_deref() == Some("local") {
+        // Explicit local discovery is the player-uploaded library. Keep the
+        // distinction from the broader reserved effective-catalogue query.
+        query.insert("source".into(), "local".into());
     }
     // Explicit official selection escapes the reserved server query syntax.
     // The shared backend owns all filter and opaque cursor interpretation.
@@ -458,6 +467,9 @@ async fn official_search(state: &AppState, user_id: i64, query: &str) -> Result<
             .bind(ids).fetch_all(&state.pool).await?;
         sets.retain(|set| active.contains(&set["id"].as_i64().unwrap()));
     }
+    for set in sets {
+        crate::native_media::decorate_set(set)?;
+    }
     Ok(value)
 }
 
@@ -556,7 +568,7 @@ async fn server_search(state: &AppState, user_id: i64, query: &str) -> Result<Va
         }
         bytes.extend_from_slice(&chunk);
     }
-    let value: Value = serde_json::from_slice(&bytes).map_err(|_| invalid())?;
+    let mut value: Value = serde_json::from_slice(&bytes).map_err(|_| invalid())?;
     validate_server_search(&value)?;
     let sets = value["beatmapsets"].as_array().unwrap();
     let map_ids = sets
@@ -605,6 +617,9 @@ async fn server_search(state: &AppState, user_id: i64, query: &str) -> Result<Va
                 return Err(changed());
             }
         }
+    }
+    for set in value["beatmapsets"].as_array_mut().unwrap() {
+        crate::native_media::decorate_set(set)?;
     }
     Ok(value)
 }
@@ -727,29 +742,17 @@ async fn scores(
         .and_then(|v| v.parse().ok())
         .unwrap_or(50)
         .clamp(1, 100);
-    let filter_acronyms = if requested_mods.len() == 1 && requested_mods[0].acronym == "NM" {
-        requested_mods.clear();
-        Some(Vec::<String>::new())
-    } else if requested_mods.is_empty() {
+    let filter = if requested_mods.is_empty() {
         None
     } else {
-        Some(
-            requested_mods
-                .iter()
-                .map(|modifier| modifier.acronym.clone())
-                .collect::<Vec<_>>(),
-        )
+        Some(lazer::leaderboard_mod_filter(mode as u8, &requested_mods)?)
     };
-    let mods = if filter_acronyms.is_none() {
-        None
-    } else {
-        Some(i64::from(lazer::legacy_mods(mode as u8, &requested_mods)?))
-    };
-    let derived_variant = match mods {
-        Some(bits) => illya_domain::ScoreVariant::from_legacy(mode as u8, bits as u32)
-            .map_err(|_| ApiError(StatusCode::BAD_REQUEST, "invalid_score_variant"))?,
-        None => illya_domain::ScoreVariant::Vanilla,
-    };
+    let filter_acronyms = filter.as_ref().map(|value| value.acronyms.clone());
+    let mods = filter.as_ref().map(|value| value.legacy_bits);
+    let derived_variant = filter
+        .as_ref()
+        .map(|value| value.variant)
+        .unwrap_or(illya_domain::ScoreVariant::Vanilla);
     let variant = if let Some(value) = query.get("variant") {
         let explicit = lazer::requested_variant(mode as u8, Some(value))?;
         if mods.is_some() && explicit != derived_variant {

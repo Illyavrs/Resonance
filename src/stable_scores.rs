@@ -24,6 +24,10 @@ mod upload_tests;
 #[path = "stable_resilience_tests.rs"]
 mod resilience_tests;
 
+#[cfg(test)]
+#[path = "native_checksum_retry_tests.rs"]
+mod checksum_retry_tests;
+
 const MAX_SCORE_PARAMETER_BYTES: usize = 32_768;
 const MAX_SCORE_UPLOAD_BYTES: usize = 20_971_520;
 const MAX_SCORE_DISPOSITION_BYTES: usize = 8_192;
@@ -505,7 +509,7 @@ fn duplicate_payload() -> ApiError {
 }
 
 async fn saved_score(state: &AppState, ingestion_key: &str) -> Result<Option<PgRow>, ApiError> {
-    Ok(sqlx::query("SELECT s.*,b.md5 AS beatmap_md5 FROM scores s JOIN beatmaps b ON b.id=s.beatmap_id WHERE s.ingestion_key=$1")
+    Ok(sqlx::query("SELECT s.*,COALESCE(s.client_beatmap_md5,b.md5) AS beatmap_md5 FROM scores s JOIN beatmaps b ON b.id=s.beatmap_id WHERE s.ingestion_key=$1")
         .bind(ingestion_key).fetch_optional(&state.pool).await?)
 }
 
@@ -938,7 +942,7 @@ async fn submit_inner(state: AppState, multipart: Multipart) -> Result<Response,
         0
     };
     let [n300, n100, n50, geki, katu, misses] = submission.hit_counts;
-    let response=state.http.post(format!("{}/api/v1/internal/scores",state.sanctuary_url.trim_end_matches('/'))).header("x-illya-service-key",state.service_key.as_str()).json(&json!({"user_id":player.id,"beatmap_id":map_id,"mode":submission.mode,"score":submission.total_score,"accuracy":0,"max_combo":submission.max_combo,"mods":submission.mods,"passed":submission.passed,"hit_counts":{"n300":n300,"n100":n100,"n50":n50,"geki":geki,"katu":katu,"misses":misses},"client":"stable","ingestion_key":format!("stable:{}:{}",player.id,submission.checksum)})).send().await.map_err(|_|ApiError(StatusCode::SERVICE_UNAVAILABLE,"score_ingestion_unavailable"))?;
+    let response=state.http.post(format!("{}/api/v1/internal/scores",state.sanctuary_url.trim_end_matches('/'))).header("x-illya-service-key",state.service_key.as_str()).json(&json!({"user_id":player.id,"beatmap_id":map_id,"client_beatmap_md5":submission.beatmap_md5.to_ascii_lowercase(),"mode":submission.mode,"score":submission.total_score,"accuracy":0,"max_combo":submission.max_combo,"mods":submission.mods,"passed":submission.passed,"hit_counts":{"n300":n300,"n100":n100,"n50":n50,"geki":geki,"katu":katu,"misses":misses},"client":"stable","ingestion_key":format!("stable:{}:{}",player.id,submission.checksum)})).send().await.map_err(|_|ApiError(StatusCode::SERVICE_UNAVAILABLE,"score_ingestion_unavailable"))?;
     if !response.status().is_success() {
         return Err(score_ingestion_rejection(response.status()));
     }
@@ -960,7 +964,7 @@ async fn submit_inner(state: AppState, multipart: Multipart) -> Result<Response,
     if !unrestricted {
         return Err(ApiError(StatusCode::UNAUTHORIZED, "invalid_account"));
     }
-    let row = sqlx::query("SELECT s.*,b.md5 AS beatmap_md5 FROM scores s JOIN beatmaps b ON b.id=s.beatmap_id WHERE s.id=$1 FOR UPDATE OF s")
+    let row = sqlx::query("SELECT s.*,COALESCE(s.client_beatmap_md5,b.md5) AS beatmap_md5 FROM scores s JOIN beatmaps b ON b.id=s.beatmap_id WHERE s.id=$1 FOR UPDATE OF s")
         .bind(score_id).fetch_optional(&mut *tx).await?
         .ok_or(ApiError(StatusCode::BAD_GATEWAY, "invalid_ingestion_response"))?;
     // This second guard covers a winner committed during the ingestion HTTP
@@ -1024,6 +1028,7 @@ async fn submit_inner(state: AppState, multipart: Multipart) -> Result<Response,
         player.id,
         crate::native_score_publication::NativeClient::Stable,
         &ingestion_key,
+        &submission.beatmap_md5,
     )
     .await?;
     let after = result_charts(

@@ -1,5 +1,9 @@
 //! Disposable PostgreSQL and TCP integration coverage for native room scores.
 //! The controlled ingress is a crash/idempotency fixture, not a PP calculator.
+#[path = "room_checksum_tests.rs"]
+mod checksum_tests;
+#[path = "stable_room_checksum_tests.rs"]
+mod stable_checksum_tests;
 use crate::{common, room_results, room_rounds, room_scores, signalr};
 use axum::{Json, Router, extract::State, http::StatusCode, routing::post};
 use futures_util::{FutureExt, SinkExt, StreamExt};
@@ -87,13 +91,14 @@ async fn ingest(
             );
         }
         let mods = input["mods"].as_i64().unwrap();
-        sqlx::query_scalar::<_,i64>("INSERT INTO scores(user_id,beatmap_id,mode,score,accuracy,max_combo,mods,pp,passed,hit_counts,client,ingestion_key,api_mods,native_submission,score_variant) VALUES($1,$2,$3,$4,$5,$6,$7,0,$8,$9,'lazer',$10,$11,$12,$13) RETURNING id")
+        sqlx::query_scalar::<_,i64>("INSERT INTO scores(user_id,beatmap_id,mode,score,accuracy,max_combo,mods,pp,passed,hit_counts,client,ingestion_key,api_mods,native_submission,score_variant,client_beatmap_md5) VALUES($1,$2,$3,$4,$5,$6,$7,0,$8,$9,'lazer',$10,$11,$12,$13,$14) RETURNING id")
             .bind(input["user_id"].as_i64().unwrap()).bind(input["beatmap_id"].as_i64().unwrap())
             .bind(input["mode"].as_i64().unwrap() as i16).bind(input["score"].as_i64().unwrap())
             .bind(input["accuracy"].as_f64().unwrap()).bind(input["max_combo"].as_i64().unwrap() as i32)
             .bind(mods).bind(input["passed"].as_bool().unwrap()).bind(&input["hit_counts"])
             .bind(key).bind(&input["api_mods"]).bind(&input["native_submission"])
-            .bind(if mods & 128 != 0 { "relax" } else { "vanilla" }).fetch_one(&mut *tx).await.unwrap()
+            .bind(if mods & 128 != 0 { "relax" } else { "vanilla" })
+            .bind(input["client_beatmap_md5"].as_str()).fetch_one(&mut *tx).await.unwrap()
     };
     tx.commit().await.unwrap();
     if mode == 1 {
