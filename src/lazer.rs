@@ -39,6 +39,12 @@ pub fn router() -> Router<AppState> {
         .route("/api/v2/me", get(me))
         .route("/api/v2/me/", get(me))
         .route("/api/v2/me/{ruleset}", get(me_mode))
+        .route("/api/v2/users", get(users_batch))
+        .route("/api/v2/users/", get(users_batch))
+        .route("/api/v2/users/lookup", get(users_batch))
+        .route("/api/v2/users/lookup/", get(users_batch))
+        .route("/api/v2/beatmaps", get(beatmaps_batch))
+        .route("/api/v2/beatmaps/", get(beatmaps_batch))
         .route("/api/v2/users/{id}", get(user))
         .route("/api/v2/users/{id}/", get(user))
         .route("/api/v2/users/{id}/{ruleset}", get(user_mode))
@@ -322,6 +328,65 @@ async fn find_user(state: &AppState, id: &str) -> Result<Account, ApiError> {
     };
     common::account(state, numeric).await
 }
+/// Parses repeated `ids[]` (or `ids`) values. lazer batches multiplayer playlist
+/// and participant lookups through these endpoints; ignoring unknown keys keeps
+/// forward compatibility, while the cap and integer parsing bound the work.
+fn batch_ids(raw: Option<String>) -> Result<Vec<i64>, ApiError> {
+    const MAX: usize = 50;
+    let pairs: Vec<(String, String)> = serde_urlencoded::from_str(raw.as_deref().unwrap_or(""))
+        .map_err(|_| ApiError(StatusCode::BAD_REQUEST, "invalid_ids"))?;
+    let mut ids = Vec::new();
+    for (key, value) in pairs {
+        if key != "ids[]" && key != "ids" {
+            continue;
+        }
+        let id: i64 = value
+            .parse()
+            .map_err(|_| ApiError(StatusCode::BAD_REQUEST, "invalid_ids"))?;
+        if !ids.contains(&id) {
+            ids.push(id);
+        }
+        if ids.len() > MAX {
+            return Err(ApiError(StatusCode::BAD_REQUEST, "too_many_ids"));
+        }
+    }
+    Ok(ids)
+}
+
+async fn users_batch(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::RawQuery(raw): axum::extract::RawQuery,
+) -> Result<Json<Value>, ApiError> {
+    common::bearer(&state, &headers).await?;
+    let mut users = Vec::new();
+    for id in batch_ids(raw)? {
+        match find_user(&state, &id.to_string()).await {
+            Ok(account) => users.push(user_json(&account)),
+            Err(ApiError(StatusCode::NOT_FOUND, _)) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(Json(json!({ "users": users })))
+}
+
+async fn beatmaps_batch(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::RawQuery(raw): axum::extract::RawQuery,
+) -> Result<Json<Value>, ApiError> {
+    let player = common::bearer(&state, &headers).await?;
+    let mut beatmaps = Vec::new();
+    for id in batch_ids(raw)? {
+        match crate::beatmaps::resolve(&state, player.id, id).await {
+            Ok(internal) => beatmaps.push(map_json(&state, internal).await?),
+            Err(ApiError(StatusCode::NOT_FOUND, _)) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(Json(json!({ "beatmaps": beatmaps })))
+}
+
 async fn user(
     State(state): State<AppState>,
     headers: HeaderMap,
