@@ -429,6 +429,7 @@ async fn official_search(state: &AppState, user_id: i64, query: &str) -> Result<
                 "unsupported_or_invalid_search_filter",
             ),
             StatusCode::UNAUTHORIZED => ApiError(StatusCode::UNAUTHORIZED, "invalid_account"),
+            StatusCode::CONFLICT => ApiError(StatusCode::CONFLICT, "server_catalogue_changed"),
             StatusCode::TOO_MANY_REQUESTS => ApiError(
                 StatusCode::TOO_MANY_REQUESTS,
                 "official_search_rate_limited",
@@ -490,6 +491,43 @@ fn validate_official_search(value: &Value) -> Result<(), ApiError> {
         )
     {
         return Err(invalid());
+    }
+    if value
+        .get("total_is_exact")
+        .is_some_and(|value| !value.is_boolean())
+        || value
+            .get("ordering")
+            .is_some_and(|value| value != "server_modified_first")
+    {
+        return Err(invalid());
+    }
+    if let Some(cursor) = value.get("cursor_string").and_then(Value::as_str) {
+        let limit = if cursor.starts_with("illyaf2.") {
+            6144
+        } else {
+            2048
+        };
+        if cursor.is_empty()
+            || cursor.len() > limit
+            || !cursor.bytes().all(|byte| (0x20..=0x7e).contains(&byte))
+        {
+            return Err(invalid());
+        }
+    }
+    if let Some(cursor) = value["cursor"].get("illya") {
+        let cursor = cursor
+            .as_str()
+            .filter(|cursor| cursor.starts_with("illyaf2.") && cursor.len() <= 6144)
+            .ok_or_else(invalid)?;
+        if value["cursor"]
+            .as_object()
+            .is_none_or(|fields| fields.len() != 1)
+            || value
+                .get("cursor_string")
+                .is_some_and(|value| !value.is_null() && value.as_str() != Some(cursor))
+        {
+            return Err(invalid());
+        }
     }
     let mut set_ids = std::collections::HashSet::new();
     let mut map_ids = std::collections::HashSet::new();

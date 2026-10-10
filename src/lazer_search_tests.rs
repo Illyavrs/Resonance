@@ -91,6 +91,39 @@ fn native_search_rejects_invalid_internal_identity_and_cursor_shape() {
     );
 }
 
+#[test]
+fn native_search_accepts_sparse_federated_pages_and_bounds_composite_cursors() {
+    let cursor = format!("illyaf2.{}", "a".repeat(4096));
+    let value = json!({"beatmapsets":[],"total":51,"total_is_exact":false,
+        "ordering":"server_modified_first","cursor":{"illya":cursor},"cursor_string":cursor});
+    assert!(validate_official_search(&value).is_ok());
+    let query = search_query(Some(format!(
+        "s=ranked&status_modified_only=true&cursor_string={cursor}"
+    )))
+    .unwrap();
+    let (source, encoded) = search_route(query).unwrap();
+    assert_eq!(source, SearchSource::Official);
+    assert!(encoded.contains("status_modified_only=true"));
+    for (field, invalid_value) in [
+        (
+            "cursor_string",
+            json!(format!("illyaf2.{}", "a".repeat(6145))),
+        ),
+        ("cursor_string", json!("ordinary".repeat(300))),
+        ("cursor_string", json!("bad\ncursor")),
+        ("cursor_string", json!("different")),
+        ("total_is_exact", json!("false")),
+        ("ordering", json!("official_ranked_order")),
+    ] {
+        let mut invalid = value.clone();
+        invalid[field] = invalid_value;
+        assert!(validate_official_search(&invalid).is_err(), "{field}");
+    }
+    let mut invalid = value;
+    invalid["cursor"]["other"] = json!("extra");
+    assert!(validate_official_search(&invalid).is_err());
+}
+
 #[derive(Clone)]
 pub(super) struct Backend {
     pub(super) reply: Arc<Mutex<(StatusCode, Vec<u8>)>>,

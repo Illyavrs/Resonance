@@ -51,18 +51,24 @@ pub(crate) async fn ranking<'e>(
     ).bind(user).bind(mode).bind(variant.as_str()).fetch_one(db).await
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RankingOrder {
+    Performance,
+    RankedScore,
+}
+
 pub(crate) async fn ranking_page(
     pool: &PgPool,
     mode: i16,
     variant: ScoreVariant,
     country: Option<&str>,
     friends: Option<Vec<i64>>,
-    offset: i64,
-    limit: i64,
+    pagination: (i64, i64),
+    order: RankingOrder,
 ) -> Result<Vec<PgRow>, sqlx::Error> {
     sqlx::query(
         "WITH eligible AS (
-           SELECT s.user_id,s.beatmap_id,s.pp FROM scores s JOIN active_beatmaps b ON b.id=s.beatmap_id
+           SELECT s.* FROM scores s JOIN active_beatmaps b ON b.id=s.beatmap_id
            WHERE s.verification='verified' AND s.passed AND b.status='ranked' AND s.pp_eligible AND s.mode=$1 AND s.score_variant=$2
          ), best_pp AS (
            SELECT user_id,beatmap_id,max(pp) pp FROM eligible GROUP BY user_id,beatmap_id
@@ -70,16 +76,24 @@ pub(crate) async fn ranking_page(
            SELECT user_id,pp,row_number() OVER(PARTITION BY user_id ORDER BY pp DESC,beatmap_id) n FROM best_pp
          ), pp_totals AS (
            SELECT user_id,sum(pp*power(0.95,n-1)) pp FROM weighted GROUP BY user_id
+         ), best_score AS (
+           SELECT DISTINCT ON(user_id,beatmap_id) user_id,beatmap_id,classic_score
+           FROM eligible WHERE standardised_score IS NOT NULL AND classic_score IS NOT NULL
+           ORDER BY user_id,beatmap_id,standardised_score DESC,id
+         ), score_totals AS (
+           SELECT user_id,LEAST(sum(classic_score),9223372036854775807)::bigint ranked_score FROM best_score GROUP BY user_id
          ), placed AS (
-           SELECT u.id,u.country,COALESCE(t.pp,0)::float8 pp,
+           SELECT u.id,u.country,COALESCE(t.pp,0)::float8 pp,COALESCE(s.ranked_score,0)::bigint ranked_score,
            row_number() OVER(ORDER BY COALESCE(t.pp,0) DESC,u.id) global_rank,
-           row_number() OVER(PARTITION BY u.country ORDER BY COALESCE(t.pp,0) DESC,u.id) country_rank
-           FROM users u LEFT JOIN pp_totals t ON t.user_id=u.id WHERE NOT u.is_restricted
+           row_number() OVER(PARTITION BY u.country ORDER BY COALESCE(t.pp,0) DESC,u.id) country_rank,
+           row_number() OVER(ORDER BY COALESCE(s.ranked_score,0) DESC,u.id) ranked_score_rank,
+           row_number() OVER(PARTITION BY u.country ORDER BY COALESCE(s.ranked_score,0) DESC,u.id) country_ranked_score_rank
+           FROM users u LEFT JOIN pp_totals t ON t.user_id=u.id LEFT JOIN score_totals s ON s.user_id=u.id WHERE NOT u.is_restricted
          ), filtered AS (
            SELECT *,count(*) OVER() total FROM placed
            WHERE ($3::text IS NULL OR country=$3) AND ($4::bigint[] IS NULL OR id=ANY($4))
-         ) SELECT * FROM filtered ORDER BY global_rank LIMIT $6 OFFSET $5",
-    ).bind(mode).bind(variant.as_str()).bind(country).bind(friends).bind(offset).bind(limit).fetch_all(pool).await
+         ) SELECT * FROM filtered ORDER BY CASE WHEN $7::boolean THEN ranked_score_rank ELSE global_rank END LIMIT $6 OFFSET $5",
+    ).bind(mode).bind(variant.as_str()).bind(country).bind(friends).bind(pagination.0).bind(pagination.1).bind(order == RankingOrder::RankedScore).fetch_all(pool).await
 }
 
 #[cfg(test)]

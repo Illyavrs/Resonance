@@ -851,12 +851,15 @@ fn room_settings(value: &Value) -> Result<Value, &'static str> {
         json!({"name":name,"playlistItemId":field(value,"playlistItemId",1).as_i64().unwrap_or(0),"password":password,"matchType":1,"queueMode":queue_mode,"autoStartDuration":0,"autoSkip":field(value,"autoSkip",6).as_bool().unwrap_or(false),"maxParticipants":max}),
     )
 }
-async fn playlist_item(
-    tx: &mut Transaction<'_, Postgres>,
-    value: &Value,
-    id: i64,
-    owner: i64,
-) -> Result<Value, &'static str> {
+struct PlaylistInput {
+    beatmap_id: i64,
+    ruleset: i64,
+    checksum: String,
+    required: Value,
+    allowed: Value,
+}
+
+fn playlist_input(value: &Value) -> Result<PlaylistInput, &'static str> {
     let beatmap_id = integer(field(value, "beatmapID", 2))?;
     if !crate::native_maps::valid_id(beatmap_id) {
         return Err("invalid_beatmap_identity");
@@ -866,6 +869,103 @@ async fn playlist_item(
         return Err("invalid_ruleset");
     }
     let checksum = text(field(value, "beatmapChecksum", 3), 32)?;
+    if checksum.len() != 32 || !checksum.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err("invalid_beatmap_identity");
+    }
+    let required = mods(field(value, "requiredMods", 5))?;
+    crate::room_rounds::canonical_mods(ruleset as u8, &required).map_err(|e| e.1)?;
+    let allowed = mods(field(value, "allowedMods", 6))?;
+    let mut seen = HashSet::new();
+    for modifier in allowed.as_array().unwrap() {
+        if !seen.insert(modifier["acronym"].as_str().unwrap()) {
+            return Err("invalid_mods");
+        }
+        crate::room_rounds::canonical_mods(ruleset as u8, &json!([modifier])).map_err(|e| e.1)?;
+    }
+    Ok(PlaylistInput {
+        beatmap_id,
+        ruleset,
+        checksum,
+        required,
+        allowed,
+    })
+}
+
+async fn playlist_discovery_actor(
+    state: &AppState,
+    headers: &HeaderMap,
+    uid: i64,
+) -> Result<(), &'static str> {
+    let account = common::bearer(state, headers).await.map_err(|error| {
+        if matches!(error.0, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) {
+            "session_revoked"
+        } else {
+            error.1
+        }
+    })?;
+    if account.id != uid || !account.can("chat.send") {
+        return Err("session_revoked");
+    }
+    Ok(())
+}
+
+/// Discover the immutable difficulty before acquiring room, user or session
+/// locks. The mutation independently repeats authorization and map admission
+/// afterward, so revocation or withdrawal during this HTTP await stays terminal.
+async fn discover_playlist_maps(
+    state: &AppState,
+    uid: i64,
+    headers: &HeaderMap,
+    source: &[Value],
+) -> Result<(), &'static str> {
+    let inputs = source
+        .iter()
+        .map(playlist_input)
+        .collect::<Result<Vec<_>, _>>()?;
+    playlist_discovery_actor(state, headers, uid).await?;
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let mut identities = HashSet::new();
+        for input in &inputs {
+            if !identities.insert((input.beatmap_id, input.checksum.to_ascii_lowercase())) {
+                continue;
+            }
+            crate::native_maps::resolve_checksum_for_id(
+                state,
+                uid,
+                &input.checksum,
+                input.beatmap_id,
+            )
+            .await
+            .map_err(|error| {
+                if error.1 == "beatmap_id_mismatch" {
+                    "beatmap_checksum_mismatch"
+                } else {
+                    error.1
+                }
+            })?
+            .ok_or("beatmap_not_found")?;
+            playlist_discovery_actor(state, headers, uid).await?;
+        }
+        Ok::<(), &'static str>(())
+    })
+    .await
+    .map_err(|_| "map_resolution_unavailable")??;
+    playlist_discovery_actor(state, headers, uid).await
+}
+
+async fn playlist_item(
+    tx: &mut Transaction<'_, Postgres>,
+    value: &Value,
+    id: i64,
+    owner: i64,
+) -> Result<Value, &'static str> {
+    let PlaylistInput {
+        beatmap_id,
+        ruleset,
+        checksum,
+        required,
+        allowed,
+    } = playlist_input(value)?;
     let row =
         sqlx::query("SELECT id,md5,mode,stars,native_set_id FROM beatmaps WHERE native_id=$1")
             .bind(beatmap_id)
@@ -894,16 +994,6 @@ async fn playlist_item(
         .fetch_one(&mut **tx)
         .await
         .map_err(db)?;
-    let required = mods(field(value, "requiredMods", 5))?;
-    crate::room_rounds::canonical_mods(ruleset as u8, &required).map_err(|e| e.1)?;
-    let allowed = mods(field(value, "allowedMods", 6))?;
-    let mut seen = HashSet::new();
-    for modifier in allowed.as_array().unwrap() {
-        if !seen.insert(modifier["acronym"].as_str().unwrap()) {
-            return Err("invalid_mods");
-        }
-        crate::room_rounds::canonical_mods(ruleset as u8, &json!([modifier])).map_err(|e| e.1)?;
-    }
     let rating = row.get::<f64, _>("stars");
     if !rating.is_finite() {
         return Err("invalid_star_rating");
@@ -1063,6 +1153,7 @@ async fn multiplayer(
                 .as_array()
                 .filter(|v| !v.is_empty() && v.len() <= 100)
                 .ok_or("playlist_required")?;
+            discover_playlist_maps(state, uid, &c.headers, source).await?;
             let mut tx = state.pool.begin().await.map_err(db)?;
             let account = common::lazer_account_in_tx(&mut tx, &c.headers, uid)
                 .await
@@ -2018,6 +2109,39 @@ async fn edit_playlist(
     target: &str,
     value: &Value,
 ) -> HubResult {
+    if target != "RemovePlaylistItem" {
+        // Check authority without locking before allowing an upstream lookup;
+        // all of these conditions are checked again by locked_room below.
+        playlist_discovery_actor(state, headers, uid).await?;
+        let current = sqlx::query("SELECT r.* FROM lazer_rooms r JOIN lazer_room_members m ON m.room_id=r.id WHERE m.user_id=$1")
+            .bind(uid)
+            .fetch_optional(&state.pool)
+            .await
+            .map_err(db)?
+            .ok_or("not_in_room")?;
+        let settings: Value = current.get("settings");
+        if current.get::<i16, _>("state") != 0 {
+            return Err("room_busy");
+        }
+        if target != "AddPlaylistItem" || settings["queueMode"] == 0 {
+            host(&current, uid)?;
+        }
+        let playlist: Value = current.get("playlist");
+        if target == "AddPlaylistItem" {
+            if playlist.as_array().is_some_and(|items| items.len() >= 100) {
+                return Err("playlist_full");
+            }
+        } else {
+            let id = integer(field(value, "id", 0))?;
+            if !playlist
+                .as_array()
+                .is_some_and(|items| items.iter().any(|item| item["id"] == id))
+            {
+                return Err("playlist_item_not_found");
+            }
+        }
+        discover_playlist_maps(state, uid, headers, std::slice::from_ref(value)).await?;
+    }
     let (mut tx, row) = locked_room(
         state,
         uid,
@@ -3258,6 +3382,10 @@ fn wire_result(mut value: Value, binary: bool) -> Value {
         value
     }
 }
+
+#[cfg(test)]
+#[path = "signalr/room_discovery_tests.rs"]
+mod room_discovery_tests;
 
 #[cfg(test)]
 mod tests {

@@ -142,7 +142,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .merge(assets::router())
         .merge(native_media::router())
         .layer(DefaultBodyLimit::max(4_194_304))
-        .layer(TraceLayer::new_for_http().make_span_with(|request: &axum::http::Request<axum::body::Body>| tracing::info_span!("http_request", method=%request.method(), path=%request.uri().path())))
+        .layer(TraceLayer::new_for_http()
+            .make_span_with(|request: &axum::http::Request<axum::body::Body>| tracing::info_span!("http_request", method=%request.method(), path=%request.uri().path()))
+            .on_response(tower_http::trace::DefaultOnResponse::new().level(tracing::Level::INFO)))
         .with_state(state);
     let address = env::var("RESONANCE_BIND").unwrap_or_else(|_| "0.0.0.0:8081".into());
     let listener = tokio::net::TcpListener::bind(&address).await?;

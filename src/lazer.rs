@@ -43,7 +43,7 @@ pub fn router() -> Router<AppState> {
         .route("/api/v2/users/{id}/", get(user))
         .route("/api/v2/users/{id}/{ruleset}", get(user_mode))
         .route("/api/v2/users/{id}/scores/{kind}", get(user_scores))
-        .route("/api/v2/rankings/{ruleset}/performance", get(rankings))
+        .route("/api/v2/rankings/{ruleset}/{kind}", get(rankings))
         .route("/api/v2/beatmaps/{id}", get(beatmap))
         .route("/api/v2/beatmaps/{id}/solo/scores", post(create_score))
         .route(
@@ -423,14 +423,28 @@ async fn user_scores(
 async fn rankings(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Path(ruleset): Path<String>,
+    Path((ruleset, kind)): Path<(String, String)>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Result<Json<Value>, ApiError> {
     let viewer = common::bearer(&state, &headers).await?;
     let ruleset = mode(&ruleset)?;
+    let order = match kind.as_str() {
+        "performance" => crate::score_aggregates::RankingOrder::Performance,
+        "score" => crate::score_aggregates::RankingOrder::RankedScore,
+        _ => return Err(ApiError(StatusCode::NOT_FOUND, "ranking_not_found")),
+    };
     let variant = requested_variant(ruleset, query.get("variant").map(String::as_str))?;
+    if let (Some(page), Some(cursor)) = (query.get("page"), query.get("cursor[page]"))
+        && page != cursor
+    {
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            "conflicting_ranking_page",
+        ));
+    }
     let page = query
         .get("page")
+        .or_else(|| query.get("cursor[page]"))
         .map(|value| value.parse::<i64>())
         .transpose()
         .map_err(|_| ApiError(StatusCode::BAD_REQUEST, "invalid_ranking_page"))?
@@ -463,8 +477,8 @@ async fn rankings(
         variant,
         country.as_deref(),
         friends.clone(),
-        (page - 1) * 50,
-        50,
+        ((page - 1) * 50, 50),
+        order,
     )
     .await?;
     let total = if let Some(row) = rows.first() {
@@ -494,12 +508,17 @@ async fn rankings(
         .await?
         .0;
         let mut statistics = profile["statistics"].clone();
+        // UserStatistics.global_rank remains the player's PP rank on both
+        // endpoints. Ranked-score placement controls this list's ordering.
+        statistics["ranked_score_rank"] = json!(row.get::<i64, _>("ranked_score_rank"));
+        statistics["country_ranked_score_rank"] =
+            json!(row.get::<i64, _>("country_ranked_score_rank"));
         statistics["user"] = profile;
         statistics["score_variant"] = json!(variant);
         ranking.push(statistics);
     }
     Ok(Json(
-        json!({"ranking":ranking,"total":total,"score_variant":variant,"ruleset_id":ruleset}),
+        json!({"ranking":ranking,"total":total,"score_variant":variant,"ruleset_id":ruleset,"cursor":if page < 201 && page * 50 < total {Some(json!({"page":page + 1}))} else {None}}),
     ))
 }
 

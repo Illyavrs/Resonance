@@ -125,6 +125,48 @@ struct Fixture {
     other: i64,
     token: String,
 }
+
+#[tokio::test]
+async fn native_player_ranking_routes_retain_bearer_authentication() {
+    let pool = PgPoolOptions::new()
+        .connect_lazy("postgres://unused:unused@127.0.0.1:1/unused")
+        .unwrap();
+    let app = super::super::router().with_state(state(pool));
+    for ruleset in ["osu", "taiko", "fruits", "mania"] {
+        for kind in ["performance", "score"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/api/v2/rankings/{ruleset}/{kind}?page=1"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+            assert!(response.headers().get("location").is_none());
+        }
+    }
+}
+
+#[test]
+fn native_read_variants_reject_embedded_query_delimiters() {
+    for malformed in ["vanilla?page=1", "vanilla?type=global", "relax?page=2"] {
+        let error = requested_variant(0, Some(malformed)).unwrap_err();
+        assert_eq!(error.0, StatusCode::BAD_REQUEST);
+        assert_eq!(error.1, "invalid_score_variant");
+    }
+    assert_eq!(
+        requested_variant(0, Some("vanilla")).unwrap(),
+        ScoreVariant::Vanilla
+    );
+    assert_eq!(
+        requested_variant(0, Some("relax")).unwrap(),
+        ScoreVariant::Relax
+    );
+}
+
 impl Fixture {
     async fn new() -> Self {
         let url = std::env::var("ILLYA_TEST_DATABASE_URL")
@@ -212,6 +254,194 @@ impl Fixture {
             .await
             .unwrap();
         self.admin.close().await;
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires ILLYA_TEST_DATABASE_URL pointing to owned disposable local PostgreSQL"]
+async fn native_player_rankings_sort_by_the_requested_metric_and_keep_filtered_totals() {
+    let f = Fixture::new().await;
+    let result = std::panic::AssertUnwindSafe(async {
+        let map = f
+            .map(f.user, true, "66666666666666666666666666666666", "ranked")
+            .await;
+        f.score(f.user, map, 800_000, 100.0, "verified", true)
+            .await;
+        let pp_winner = f
+            .score(f.user, map, 100_000, 200.0, "verified", true)
+            .await;
+        // A large display value cannot override standardized best-per-map
+        // selection; the lower standardized score only improves PP.
+        sqlx::query("UPDATE scores SET classic_score=9000000 WHERE id=$1")
+            .bind(pp_winner)
+            .execute(&f.state.pool)
+            .await
+            .unwrap();
+        f.score(f.other, map, 900_000, 100.0, "verified", true)
+            .await;
+        f.score(f.other, map, 1_000_000, 900.0, "pending", true)
+            .await;
+        f.score(f.other, map, 1_000_000, 900.0, "verified", false)
+            .await;
+        sqlx::query("UPDATE users SET country='JP' WHERE id=$1")
+            .bind(f.other)
+            .execute(&f.state.pool)
+            .await
+            .unwrap();
+
+        // The old bridge suffixed APIRequest.Uri before the stock builders
+        // appended their own query delimiter. Keep rejecting that malformed
+        // value while the corrected native tuple composition stays accepted.
+        for path in [
+            "/api/v2/rankings/osu/performance?variant=vanilla?page=1",
+            "/api/v2/beatmaps/740001/scores?variant=vanilla?type=global&mode=osu&limit=50",
+        ] {
+            let (status, error) = f.get(path).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(error["error"], "invalid_score_variant");
+        }
+        let (status, scores) = f
+            .get("/api/v2/beatmaps/740001/scores?type=global&mode=osu&limit=50&variant=vanilla")
+            .await;
+        assert_eq!(status, StatusCode::OK, "{scores}");
+        assert_eq!(scores["score_count"], 2);
+
+        for (kind, expected) in [
+            ("performance", [f.user, f.other]),
+            ("score", [f.other, f.user]),
+        ] {
+            let (status, board) = f
+                .get(&format!("/api/v2/rankings/osu/{kind}?page=1"))
+                .await;
+            assert_eq!(status, StatusCode::OK, "{kind}: {board}");
+            assert_eq!(board["total"], 2);
+            assert_eq!(board["cursor"], Value::Null);
+            let players = board["ranking"].as_array().unwrap();
+            assert_eq!(players.len(), 2);
+            for (entry, id) in players.iter().zip(expected) {
+                assert_eq!(entry["user"]["id"], id);
+                assert_eq!(entry["score_variant"], "vanilla");
+                assert!(entry["grade_counts"].is_object());
+                assert!(entry["level"].is_object());
+                assert!(entry["user"]["statistics"].is_object());
+                if id == f.user {
+                    assert_eq!(entry["pp"], 200.0);
+                    assert_eq!(entry["ranked_score"], 800_000);
+                    assert_eq!(entry["global_rank"], 1);
+                    assert_eq!(entry["ranked_score_rank"], 2);
+                } else {
+                    assert_eq!(entry["pp"], 100.0);
+                    assert_eq!(entry["ranked_score"], 900_000);
+                    assert_eq!(entry["global_rank"], 2);
+                    assert_eq!(entry["ranked_score_rank"], 1);
+                }
+            }
+            for query in ["page=2", "cursor%5Bpage%5D=2"] {
+                let (status, empty) = f
+                    .get(&format!("/api/v2/rankings/osu/{kind}?{query}"))
+                    .await;
+                assert_eq!(status, StatusCode::OK);
+                assert_eq!(empty["ranking"], json!([]));
+                assert_eq!(empty["total"], 2);
+                assert_eq!(empty["cursor"], Value::Null);
+            }
+            let (status, country) = f
+                .get(&format!("/api/v2/rankings/osu/{kind}?country=jp"))
+                .await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(country["total"], 1);
+            assert_eq!(country["ranking"][0]["user"]["id"], f.other);
+            assert_eq!(country["ranking"][0]["country_rank"], 1);
+            let (status, empty) = f
+                .get(&format!("/api/v2/rankings/osu/{kind}?country=JP&page=2"))
+                .await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(empty["total"], 1);
+            assert_eq!(empty["ranking"], json!([]));
+            let (status, friends) = f
+                .get(&format!("/api/v2/rankings/osu/{kind}?filter=friends"))
+                .await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(friends["total"], 1);
+            assert_eq!(friends["ranking"][0]["user"]["id"], f.user);
+            let (status, empty) = f
+                .get(&format!("/api/v2/rankings/osu/{kind}?filter=friends&page=2"))
+                .await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(empty["total"], 1);
+            assert_eq!(empty["ranking"], json!([]));
+        }
+        sqlx::query("INSERT INTO user_relationships(user_id,target_id,relation_type) VALUES($1,$2,'friend')")
+            .bind(f.user)
+            .bind(f.other)
+            .execute(&f.state.pool)
+            .await
+            .unwrap();
+        let (status, friends) = f
+            .get("/api/v2/rankings/osu/score?filter=friends")
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(friends["total"], 2);
+        assert_eq!(friends["ranking"][0]["user"]["id"], f.other);
+
+        let rx_user = f.score(f.user, map, 200_000, 10.0, "verified", true).await;
+        let rx_other = f.score(f.other, map, 100_000, 300.0, "verified", true).await;
+        // RX has no common score scale. It remains a distinct PP partition,
+        // and its ranked-score total must stay zero instead of using raw score.
+        sqlx::query("UPDATE scores SET score_variant='relax',mods=128,standardised_score=NULL,classic_score=NULL,score_scale_status='unavailable',native_submission='{\"rank\":\"S\",\"statistics\":{\"great\":120},\"mods\":[{\"acronym\":\"RX\"}]}' WHERE id=ANY($1)")
+            .bind(vec![rx_user, rx_other])
+            .execute(&f.state.pool)
+            .await
+            .unwrap();
+        let (status, relax) = f
+            .get("/api/v2/rankings/osu/performance?variant=relax")
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(relax["ranking"][0]["user"]["id"], f.other);
+        assert_eq!(relax["ranking"][0]["pp"], 300.0);
+        assert_eq!(relax["ranking"][1]["pp"], 10.0);
+        assert!(relax["ranking"].as_array().unwrap().iter().all(|entry| {
+            entry["ranked_score"] == 0 && entry["score_variant"] == "relax"
+        }));
+        let (status, relax_score) = f
+            .get("/api/v2/rankings/osu/score?variant=relax")
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(relax_score["ranking"][0]["user"]["id"], f.user);
+        assert_eq!(relax_score["ranking"][0]["global_rank"], 2);
+        assert_eq!(relax_score["ranking"][0]["ranked_score"], 0);
+
+        for query in [
+            "page=0",
+            "page=202",
+            "page=oops",
+            "country=JPN",
+            "filter=invalid",
+            "page=1&cursor%5Bpage%5D=2",
+        ] {
+            let (status, _) = f
+                .get(&format!("/api/v2/rankings/osu/score?{query}"))
+                .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{query}");
+        }
+        let (status, _) = f.get("/api/v2/rankings/osu/unknown").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        sqlx::query("UPDATE users SET is_restricted=true WHERE id=$1")
+            .bind(f.other)
+            .execute(&f.state.pool)
+            .await
+            .unwrap();
+        let (status, unrestricted) = f.get("/api/v2/rankings/osu/score").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(unrestricted["total"], 1);
+        assert_eq!(unrestricted["ranking"][0]["user"]["id"], f.user);
+        assert_eq!(unrestricted["ranking"][0]["ranked_score_rank"], 1);
+    })
+    .catch_unwind()
+    .await;
+    f.cleanup().await;
+    if let Err(error) = result {
+        std::panic::resume_unwind(error);
     }
 }
 
