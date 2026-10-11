@@ -684,7 +684,7 @@ def run():
             body, headers = multipart(fields)
         response, response_headers = gateway.request("POST", path, body, headers, expected=422)
         guide = json.loads(response)
-        assert guide["url"] == gateway.base + "/register"
+        assert guide["url"] == gateway.base + "/register", (guide["url"], gateway.base)
         assert guide["form_error"]["redirect"] == guide["url"]
         assert guide["url"] in guide["form_error"]["user"]["username"][0]
         assert b"never-create-this-account" not in response and b"website-only@example.test" not in response
