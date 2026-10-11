@@ -252,7 +252,10 @@ async fn closed_without_logout(socket: &mut Socket) {
                 None | Some(Err(_)) | Some(Ok(ClientMessage::Close(_))) => return,
                 Some(Ok(ClientMessage::Text(text))) => {
                     let value: Value = serde_json::from_str(&text).unwrap();
-                    assert_ne!(value["event"], "logout", "refreshable session was logged out");
+                    assert_ne!(
+                        value["event"], "logout",
+                        "refreshable session was logged out"
+                    );
                 }
                 Some(Ok(_)) => {}
             }
