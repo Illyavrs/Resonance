@@ -207,8 +207,9 @@ fn native_server_validation_bounds_membership_and_rejects_duplicate_identities()
     assert!(validate_server_search(&page).is_err());
     let mut page = result();
     let original = page["beatmapsets"][0].clone();
+    page["total"] = json!(101);
     page["beatmapsets"] = json!(
-        (0..51)
+        (0..101)
             .map(|index| {
                 let mut set = original.clone();
                 set["id"] = json!(820001 + index);
