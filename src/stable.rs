@@ -185,6 +185,14 @@ async fn login(state: &AppState, client: &str, body: &[u8]) -> Result<Response, 
         stats_on_connection(&mut connection, &player, UserAction::default()).await?
     };
     append(&mut output, self_stats.packet())?;
+    {
+        // Everyone already online learns about the new player, so room slots and the user list show them.
+        let mut announcement = Vec::new();
+        append_presence(&mut announcement, &player, login.utc_offset, 0)?;
+        append(&mut announcement, self_stats.packet())?;
+        let mut connection = state.pool.acquire().await?;
+        queue_for_others(&mut connection, player.id, &announcement).await?;
+    }
     let online = sqlx::query("SELECT user_id,utc_offset,action FROM bancho_sessions WHERE expires_at>now() AND user_id<>$1 LIMIT 1000").bind(player.id).fetch_all(&state.pool).await?;
     for session in online {
         if let Ok(other) = common::account(state, session.get("user_id")).await {
@@ -203,6 +211,21 @@ async fn login(state: &AppState, client: &str, body: &[u8]) -> Result<Response, 
         wire::string_packet(wire::server::NOTIFICATION, "Welcome to Illyaverse."),
     )?;
     Ok(binary(output, Some(&token)))
+}
+
+/// Queue a packet for every other connected player. Clients only learn who a user is from the
+/// presence and stats they are sent, so a player joining or leaving must be pushed to the rest.
+pub(crate) async fn queue_for_others(
+    db: &mut sqlx::PgConnection,
+    user: i64,
+    payload: &[u8],
+) -> Result<(), ApiError> {
+    sqlx::query("INSERT INTO bancho_packet_queue(user_id,payload,expires_at) SELECT user_id,$2,now()+interval '2 minutes' FROM bancho_sessions WHERE user_id<>$1 AND expires_at>now()")
+        .bind(user)
+        .bind(payload)
+        .execute(db)
+        .await?;
+    Ok(())
 }
 
 fn append_presence(
@@ -360,6 +383,14 @@ async fn poll(state: &AppState, token: &str, body: &[u8]) -> Result<Response, Ap
         match packet.id {
             wire::client::LOGOUT => {
                 crate::multiplayer::disconnect(&mut tx, player.id).await?;
+                let mut quit = id32(player.id)?.to_le_bytes().to_vec();
+                quit.push(0);
+                queue_for_others(
+                    &mut tx,
+                    player.id,
+                    &wire::encode_packet(wire::server::USER_LOGOUT, &quit)?,
+                )
+                .await?;
                 sqlx::query("DELETE FROM bancho_sessions WHERE token_hash=$1")
                     .bind(common::token_hash(token))
                     .execute(&mut *tx)
@@ -382,12 +413,13 @@ async fn poll(state: &AppState, token: &str, body: &[u8]) -> Result<Response, Ap
             }
             wire::client::CHANGE_ACTION => {
                 action = UserAction::decode(packet.payload)?;
-                append(
-                    &mut output,
-                    stats_on_connection(&mut tx, &player, action.clone())
-                        .await?
-                        .packet(),
-                )?;
+                let stats = stats_on_connection(&mut tx, &player, action.clone())
+                    .await?
+                    .packet();
+                if let Ok(bytes) = &stats {
+                    queue_for_others(&mut tx, player.id, bytes).await?;
+                }
+                append(&mut output, stats)?;
             }
             wire::client::REQUEST_STATUS_UPDATE => {
                 append(
