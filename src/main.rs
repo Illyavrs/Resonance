@@ -1,4 +1,5 @@
 mod assets;
+mod bot;
 mod beatmaps;
 mod common;
 #[cfg(test)]
@@ -107,6 +108,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Err(error) = replay_capture::recover_pending(&state).await {
         tracing::warn!(code = error.1, "replay recovery will retry in background");
     }
+    bot::spawn(state.clone());
     let recovery_state = state.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));

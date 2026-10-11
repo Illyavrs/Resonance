@@ -9,6 +9,9 @@ use resonance_protocol::{
 };
 use sqlx::{PgConnection, Row};
 
+#[path = "room_bot.rs"]
+pub(crate) mod room_bot;
+
 // Packet numbers are interoperability facts, independent of authorization.
 const UPDATE: u16 = 26;
 const NEW: u16 = 27;
@@ -835,6 +838,7 @@ async fn spectate(
 }
 
 pub async fn special_chat(
+    state: &AppState,
     db: &mut PgConnection,
     user: &Account,
     target: &str,
@@ -860,6 +864,9 @@ pub async fn special_chat(
                 return Err(ApiError(StatusCode::FORBIDDEN, "room_membership_required"));
             };
             send_room(db, m.id as i16, &packet, Some(user.id)).await?;
+            if content.starts_with('!') {
+                room_bot::run(state, db, user, content).await?;
+            }
             Ok(true)
         }
         "#spectator" => {

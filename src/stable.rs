@@ -206,6 +206,11 @@ async fn login(state: &AppState, client: &str, body: &[u8]) -> Result<Response, 
             )?;
         }
     }
+    {
+        // The bot is always shown as online, like BanchoBot.
+        let mut connection = state.pool.acquire().await?;
+        append_bot(&mut connection, &mut output).await?;
+    }
     append(
         &mut output,
         wire::string_packet(wire::server::NOTIFICATION, "Welcome to Illyaverse."),
@@ -226,6 +231,20 @@ pub(crate) async fn queue_for_others(
         .execute(db)
         .await?;
     Ok(())
+}
+
+/// Presence and stats for IllyaBot, which has no session of its own.
+async fn append_bot(db: &mut sqlx::PgConnection, output: &mut Vec<u8>) -> Result<(), ApiError> {
+    let Ok(bot) = common::account_on_connection(&mut *db, crate::bot::BOT_ID).await else {
+        return Ok(());
+    };
+    append_presence(output, &bot, 0, 0)?;
+    append(
+        output,
+        stats_on_connection(db, &bot, UserAction::default())
+            .await?
+            .packet(),
+    )
 }
 
 fn append_presence(
@@ -517,6 +536,7 @@ async fn poll(state: &AppState, token: &str, body: &[u8]) -> Result<Response, Ap
                 common::rate_limit(state, format!("chat:{}", player.id), 30).await?;
                 if packet.id == wire::client::SEND_PUBLIC_MESSAGE {
                     if crate::multiplayer::special_chat(
+                        state,
                         &mut tx,
                         &player,
                         &message.recipient,
@@ -590,6 +610,20 @@ async fn poll(state: &AppState, token: &str, body: &[u8]) -> Result<Response, Ap
                     return Err(ApiError(StatusCode::BAD_REQUEST, "too_many_users"));
                 }
                 for id in ids {
+                    if i64::from(id) == crate::bot::BOT_ID {
+                        if packet.id == wire::client::USER_STATS_REQUEST {
+                            let bot = common::account_in_tx(&mut tx, crate::bot::BOT_ID).await?;
+                            append(
+                                &mut output,
+                                stats_on_connection(&mut tx, &bot, UserAction::default())
+                                    .await?
+                                    .packet(),
+                            )?;
+                        } else {
+                            append_bot(&mut tx, &mut output).await?;
+                        }
+                        continue;
+                    }
                     let Some(online) = sqlx::query("SELECT action,utc_offset FROM bancho_sessions WHERE user_id=$1 AND expires_at>now()").bind(i64::from(id)).fetch_optional(&mut *tx).await? else {continue};
                     let Ok(other) = common::account_in_tx(&mut tx, i64::from(id)).await else {
                         continue;
