@@ -150,7 +150,7 @@ async fn initialise(state: &AppState, user: i64) -> Result<(), ApiError> {
             .rows_affected()
             > 0;
     if inserted {
-        sqlx::query("INSERT INTO lazer_channel_members(user_id,channel_id) SELECT $1,id FROM channels WHERE kind='PUBLIC' AND required_permission IS NULL AND name IN('general','mapping','help') ON CONFLICT DO NOTHING")
+        sqlx::query("INSERT INTO lazer_channel_members(user_id,channel_id) SELECT $1,id FROM channels WHERE kind='PUBLIC' AND required_permission IS NULL AND name IN('general','mapping','help','announce') ON CONFLICT DO NOTHING")
             .bind(user).execute(&mut *tx).await?;
     }
     tx.commit().await?;
@@ -577,6 +577,13 @@ async fn store_message(
         let membership=sqlx::query("SELECT user_id FROM lazer_channel_members WHERE user_id=$1 AND channel_id=$2 FOR SHARE").bind(user.id).bind(id).fetch_optional(&mut *tx).await?;
         if membership.is_none() {
             return Err(ApiError(StatusCode::FORBIDDEN, "join_channel_first").into());
+        }
+        let read_only: bool = sqlx::query_scalar("SELECT read_only FROM channels WHERE id=$1")
+            .bind(id)
+            .fetch_one(&mut *tx)
+            .await?;
+        if read_only {
+            return Err(ApiError(StatusCode::FORBIDDEN, "channel_read_only").into());
         }
         require_send_unsilenced(&mut tx, user.id).await?;
         sqlx::query("INSERT INTO chat_messages(channel_id,user_id,content,is_action,client_uuid) VALUES($1,$2,$3,$4,$5) RETURNING *").bind(id).bind(user.id).bind(content).bind(input.is_action).bind(uuid).fetch_one(&mut *tx).await?

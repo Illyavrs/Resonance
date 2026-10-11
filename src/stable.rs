@@ -495,7 +495,7 @@ async fn poll(state: &AppState, token: &str, body: &[u8]) -> Result<Response, Ap
                         continue;
                     }
                     if let Some(row) =
-                        sqlx::query("SELECT id,required_permission FROM channels WHERE name=$1")
+                        sqlx::query("SELECT id,required_permission,read_only FROM channels WHERE name=$1")
                             .bind(message.recipient.trim_start_matches('#'))
                             .fetch_optional(&mut *tx)
                             .await?
@@ -503,6 +503,7 @@ async fn poll(state: &AppState, token: &str, body: &[u8]) -> Result<Response, Ap
                         let id: i64 = row.get("id");
                         let permission: Option<String> = row.get("required_permission");
                         if channels.contains(&id)
+                            && !row.get::<bool, _>("read_only")
                             && permission.as_deref().is_none_or(|p| {
                                 !matches!(p, "lazer.room" | "chat.pm") && player.can(p)
                             })
