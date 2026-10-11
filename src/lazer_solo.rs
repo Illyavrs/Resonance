@@ -287,6 +287,19 @@ async fn process(
     validate_score(&saved, uid, map, token, payload, &input, &client_checksum)?;
     sqlx::query("UPDATE lazer_score_tokens SET consumed_at=COALESCE(consumed_at,now()),score_id=$2,processing_status='processed',processing_error=NULL WHERE id=$1")
         .bind(token).bind(score_id).execute(&mut *tx).await?;
+    if !input.passed {
+        // A failed play has no replay to wait for, so it publishes now like stable's does. Passed
+        // scores publish once their replay capture completes.
+        crate::native_score_publication::publish(
+            &mut tx,
+            score_id,
+            uid,
+            crate::native_score_publication::NativeClient::Lazer,
+            &format!("lazer:{token}"),
+            &client_checksum,
+        )
+        .await?;
+    }
     tx.commit().await?;
     Ok(score_id)
 }
