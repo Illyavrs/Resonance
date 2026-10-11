@@ -1,5 +1,7 @@
 //! Profile score totals use a display scale; best-per-map selection uses the
 //! standardized scale. PP selection is independent of both score choices.
+//! `ranking` honours the opt-in Bancho comparison: global rank becomes the estimate and the
+//! local country rank is NULL.
 use illya_domain::ScoreVariant;
 use sqlx::{PgPool, postgres::PgRow};
 
@@ -47,7 +49,12 @@ pub(crate) async fn ranking<'e>(
            row_number() OVER(PARTITION BY u.country ORDER BY COALESCE(t.pp,0) DESC,u.id) country_rank
            FROM users u LEFT JOIN pp_totals t ON t.user_id=u.id LEFT JOIN score_totals s ON s.user_id=u.id
            WHERE NOT u.is_restricted
-         ) SELECT * FROM placed WHERE id=$1",
+         ) SELECT p.id,p.pp,p.ranked_score,
+           CASE WHEN o.bancho THEN bancho_rank_estimate($2::smallint,p.pp) ELSE p.global_rank END global_rank,
+           CASE WHEN o.bancho THEN NULL::bigint ELSE p.country_rank END country_rank
+         FROM placed p CROSS JOIN LATERAL (
+           SELECT $3='vanilla' AND p.pp>0 AND COALESCE((SELECT preferences->>'bancho_rank' FROM users WHERE id=p.id),'false')='true' bancho
+         ) o WHERE p.id=$1",
     ).bind(user).bind(mode).bind(variant.as_str()).fetch_one(db).await
 }
 

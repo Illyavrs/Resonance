@@ -253,7 +253,7 @@ async fn user_response_base(
     let total = row.get::<i64, _>("total");
     let pp = ranking.get::<f64, _>("pp");
     let is_ranked = pp > 0.0;
-    value["statistics"] = json!({"level":level(total),"global_rank":if is_ranked{Some(ranking.get::<i64,_>("global_rank"))}else{None},"country_rank":if is_ranked{Some(ranking.get::<i64,_>("country_rank"))}else{None},"pp":pp,"ranked_score":ranking.get::<i64,_>("ranked_score"),"hit_accuracy":row.get::<f64,_>("accuracy"),"play_count":row.get::<i64,_>("plays"),"total_score":total,"total_hits":row.get::<i64,_>("hits"),"maximum_combo":row.get::<i32,_>("combo"),"is_ranked":is_ranked,"grade_counts":{"ss":grades.get::<i64,_>("ss"),"ssh":grades.get::<i64,_>("ssh"),"s":grades.get::<i64,_>("s"),"sh":grades.get::<i64,_>("sh"),"a":grades.get::<i64,_>("a")}});
+    value["statistics"] = json!({"level":level(total),"global_rank":if is_ranked{Some(ranking.get::<i64,_>("global_rank"))}else{None},"country_rank":if is_ranked{ranking.get::<Option<i64>,_>("country_rank")}else{None},"pp":pp,"ranked_score":ranking.get::<i64,_>("ranked_score"),"hit_accuracy":row.get::<f64,_>("accuracy"),"play_count":row.get::<i64,_>("plays"),"total_score":total,"total_hits":row.get::<i64,_>("hits"),"maximum_combo":row.get::<i32,_>("combo"),"is_ranked":is_ranked,"grade_counts":{"ss":grades.get::<i64,_>("ss"),"ssh":grades.get::<i64,_>("ssh"),"s":grades.get::<i64,_>("s"),"sh":grades.get::<i64,_>("sh"),"a":grades.get::<i64,_>("a")}});
     value["score_scale_coverage"] = json!({"total_plays":row.get::<i64,_>("plays"),"included_plays":row.get::<i64,_>("scaled_plays"),"display":"classic_with_legacy_history"});
     value["playmode"] = json!(["osu", "taiko", "fruits", "mania"][mode as usize]);
     value["score_variant"] = json!(variant);
