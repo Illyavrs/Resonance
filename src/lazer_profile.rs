@@ -184,9 +184,17 @@ pub(super) async fn enrich_user(
     value["rank_history"] = json!({"mode":short_name,"data":history.into_iter().map(|rank|rank.unwrap_or(0)).collect::<Vec<_>>()});
     value["rank_highest"] = sqlx::query_scalar::<_,Value>("SELECT jsonb_build_object('rank',rank,'updated_at',captured_at) FROM rank_history_daily WHERE user_id=$1 AND mode=$2 AND variant=$3 AND rank IS NOT NULL ORDER BY rank,captured_at LIMIT 1")
         .bind(player.id).bind(i16::from(ruleset)).bind(variant.as_str()).fetch_optional(&state.pool).await?.unwrap_or(Value::Null);
-    // No gameplay-duration or replay-view telemetry is stored. Null and empty
-    // history express unknown rather than deriving playtime from idle tokens.
-    value["statistics"]["play_time"] = Value::Null;
+    // Gameplay time is recorded per score; replay views are not stored, so that history stays empty.
+    value["statistics"]["play_time"] = sqlx::query_scalar::<_, i64>(
+        "SELECT COALESCE(sum(play_seconds),0)::bigint FROM scores WHERE user_id=$1 AND mode=$2 AND score_variant=$3 AND verification<>'rejected'",
+    )
+    .bind(player.id)
+    .bind(i16::from(ruleset))
+    .bind(variant.as_str())
+    .fetch_one(&state.pool)
+    .await
+    .map(Value::from)
+    .unwrap_or(Value::Null);
     value["replays_watched_counts"] = json!([]);
     Ok(())
 }

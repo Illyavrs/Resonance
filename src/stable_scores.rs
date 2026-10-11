@@ -942,7 +942,14 @@ async fn submit_inner(state: AppState, multipart: Multipart) -> Result<Response,
         0
     };
     let [n300, n100, n50, geki, katu, misses] = submission.hit_counts;
-    let response=state.http.post(format!("{}/api/v1/internal/scores",state.sanctuary_url.trim_end_matches('/'))).header("x-illya-service-key",state.service_key.as_str()).json(&json!({"user_id":player.id,"beatmap_id":map_id,"client_beatmap_md5":submission.beatmap_md5.to_ascii_lowercase(),"mode":submission.mode,"score":submission.total_score,"accuracy":0,"max_combo":submission.max_combo,"mods":submission.mods,"passed":submission.passed,"hit_counts":{"n300":n300,"n100":n100,"n50":n50,"geki":geki,"katu":katu,"misses":misses},"client":"stable","ingestion_key":format!("stable:{}:{}",player.id,submission.checksum)})).send().await.map_err(|_|ApiError(StatusCode::SERVICE_UNAVAILABLE,"score_ingestion_unavailable"))?;
+    // Stable reports how long the play lasted: `st` when it finished, `ft` when it failed (milliseconds).
+    // The server caps it at the beatmap length, so a bogus value cannot inflate play time.
+    let play_seconds = fields
+        .get(if submission.passed { "st" } else { "ft" })
+        .and_then(|value| value.trim().parse::<i64>().ok())
+        .map(|millis| millis / 1000)
+        .filter(|seconds| (0..=36_000).contains(seconds));
+    let response=state.http.post(format!("{}/api/v1/internal/scores",state.sanctuary_url.trim_end_matches('/'))).header("x-illya-service-key",state.service_key.as_str()).json(&json!({"user_id":player.id,"beatmap_id":map_id,"client_beatmap_md5":submission.beatmap_md5.to_ascii_lowercase(),"mode":submission.mode,"score":submission.total_score,"accuracy":0,"max_combo":submission.max_combo,"mods":submission.mods,"passed":submission.passed,"hit_counts":{"n300":n300,"n100":n100,"n50":n50,"geki":geki,"katu":katu,"misses":misses},"client":"stable","play_seconds":play_seconds,"ingestion_key":format!("stable:{}:{}",player.id,submission.checksum)})).send().await.map_err(|_|ApiError(StatusCode::SERVICE_UNAVAILABLE,"score_ingestion_unavailable"))?;
     if !response.status().is_success() {
         return Err(score_ingestion_rejection(response.status()));
     }
