@@ -164,6 +164,12 @@ async fn native_publication_requires_matching_source_owner_key_and_saved_replay(
             assert!(!outcome.to_string().contains(&key));
         }
 
+        for (name, client) in [("stable", NativeClient::Stable), ("lazer", NativeClient::Lazer)] {
+            let (manual, key) = f.score(name, true, Some("manual.osr"), Some(true)).await;
+            sqlx::query("UPDATE scores SET submission_origin='replay' WHERE id=$1").bind(manual).execute(&f.pool).await.unwrap();
+            assert!(!attempt(&f.pool, f.owner, manual, client, &key).await);
+            assert_eq!(f.outcome(manual).await["verification"], "pending");
+        }
         let (api, key) = f.score("api", true, Some("api.osr"), Some(true)).await;
         assert!(!attempt(&f.pool, f.owner, api, NativeClient::Stable, &key).await);
         assert!(!attempt(&f.pool, f.owner, api, NativeClient::Lazer, &key).await);

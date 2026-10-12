@@ -41,6 +41,7 @@ pub(crate) async fn publish(
         "SELECT s.verification,s.passed,s.replay_path,s.replay_complete \
          FROM scores s JOIN users u ON u.id=s.user_id JOIN beatmaps b ON b.id=s.beatmap_id \
          WHERE s.id=$1 AND s.user_id=$2 AND s.client=$3 AND s.ingestion_key=$4 \
+         AND s.submission_origin='client' \
          AND lower(COALESCE(s.client_beatmap_md5,b.md5))=lower($5) \
          AND NOT u.is_restricted FOR UPDATE OF s",
     )
