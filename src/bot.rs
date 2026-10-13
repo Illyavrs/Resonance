@@ -71,10 +71,12 @@ async fn tick(state: &AppState) -> Result<(), ApiError> {
         let id: i64 = row.get("id");
         set_cursor(&mut db, "pm", id).await?;
         // The bot has no stable session to acknowledge deliveries, so settle them here.
-        sqlx::query("UPDATE protocol_private_messages SET stable_delivery_state='delivered' WHERE id=$1")
-            .bind(id)
-            .execute(&mut *db)
-            .await?;
+        sqlx::query(
+            "UPDATE protocol_private_messages SET stable_delivery_state='delivered' WHERE id=$1",
+        )
+        .bind(id)
+        .execute(&mut *db)
+        .await?;
         let sender: i64 = row.get("sender_id");
         let text: String = row.get("content");
         handle_private(state, &mut db, sender, &text, row.get("is_action")).await?;
@@ -107,12 +109,14 @@ async fn tick(state: &AppState) -> Result<(), ApiError> {
                 Err(_) => vec!["指令執行失敗，請稍後再試。".into()],
             };
             for line in lines.into_iter().take(MAX_REPLY_LINES) {
-                sqlx::query("INSERT INTO chat_messages(channel_id,user_id,content) VALUES($1,$2,$3)")
-                    .bind(row.get::<i64, _>("channel_id"))
-                    .bind(BOT_ID)
-                    .bind(clip(&line))
-                    .execute(&mut *db)
-                    .await?;
+                sqlx::query(
+                    "INSERT INTO chat_messages(channel_id,user_id,content) VALUES($1,$2,$3)",
+                )
+                .bind(row.get::<i64, _>("channel_id"))
+                .bind(BOT_ID)
+                .bind(clip(&line))
+                .execute(&mut *db)
+                .await?;
             }
         }
     }
@@ -123,13 +127,19 @@ fn clip(text: &str) -> String {
     text.chars().take(1000).collect()
 }
 
-pub(crate) async fn send_private(db: &mut PgConnection, to: i64, text: &str) -> Result<(), ApiError> {
-    sqlx::query("INSERT INTO protocol_private_messages(sender_id,recipient_id,content) VALUES($1,$2,$3)")
-        .bind(BOT_ID)
-        .bind(to)
-        .bind(clip(text))
-        .execute(db)
-        .await?;
+pub(crate) async fn send_private(
+    db: &mut PgConnection,
+    to: i64,
+    text: &str,
+) -> Result<(), ApiError> {
+    sqlx::query(
+        "INSERT INTO protocol_private_messages(sender_id,recipient_id,content) VALUES($1,$2,$3)",
+    )
+    .bind(BOT_ID)
+    .bind(to)
+    .bind(clip(text))
+    .execute(db)
+    .await?;
     Ok(())
 }
 
@@ -325,12 +335,16 @@ pub(crate) async fn dispatch(
             vec![format!("{} 擲出了 {value}", who.username)]
         }
         "server" => {
-            let stable: i64 = sqlx::query_scalar("SELECT count(DISTINCT user_id) FROM bancho_sessions WHERE expires_at>now()")
-                .fetch_one(&mut *db)
-                .await?;
-            let lazer: i64 = sqlx::query_scalar("SELECT count(*) FROM lazer_chat_activity WHERE active_until>now()")
-                .fetch_one(&mut *db)
-                .await?;
+            let stable: i64 = sqlx::query_scalar(
+                "SELECT count(DISTINCT user_id) FROM bancho_sessions WHERE expires_at>now()",
+            )
+            .fetch_one(&mut *db)
+            .await?;
+            let lazer: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM lazer_chat_activity WHERE active_until>now()",
+            )
+            .fetch_one(&mut *db)
+            .await?;
             let uptime = STARTED.get().map(|s| s.elapsed().as_secs()).unwrap_or(0);
             vec![format!(
                 "Illyaverse 在線：stable {stable} 人、lazer {lazer} 人。已持續運作 {} 小時 {} 分鐘。網站：{site}",
@@ -382,7 +396,11 @@ pub(crate) async fn dispatch(
                     row.get::<f64, _>("accuracy"),
                     row.get::<i32, _>("max_combo"),
                     row.get::<f64, _>("pp"),
-                    if row.get::<bool, _>("passed") { "通過" } else { "失敗" },
+                    if row.get::<bool, _>("passed") {
+                        "通過"
+                    } else {
+                        "失敗"
+                    },
                     ago(row.get("created_at")),
                     row.get::<i64, _>("id")
                 )],
@@ -531,8 +549,16 @@ pub(crate) async fn dispatch(
                     row.get::<String, _>("country"),
                     row.get::<DateTime<Utc>, _>("joined_at").format("%Y-%m-%d"),
                     row.get::<Option<String>, _>("roles").unwrap_or_default(),
-                    if row.get::<bool, _>("is_restricted") { "已限制" } else { "正常" },
-                    if row.get::<bool, _>("online") { "在線" } else { "離線" },
+                    if row.get::<bool, _>("is_restricted") {
+                        "已限制"
+                    } else {
+                        "正常"
+                    },
+                    if row.get::<bool, _>("online") {
+                        "在線"
+                    } else {
+                        "離線"
+                    },
                 )],
             }
         }
@@ -577,7 +603,9 @@ mod tests {
     #[test]
     fn now_playing_extracts_the_beatmap_id() {
         assert_eq!(
-            parse_now_playing("is listening to [https://osu.ppy.sh/beatmapsets/12#osu/345 Artist - Song]"),
+            parse_now_playing(
+                "is listening to [https://osu.ppy.sh/beatmapsets/12#osu/345 Artist - Song]"
+            ),
             Some(345)
         );
         assert_eq!(

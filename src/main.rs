@@ -1,6 +1,6 @@
 mod assets;
-mod bot;
 mod beatmaps;
+mod bot;
 mod common;
 #[cfg(test)]
 mod credential_race_tests;

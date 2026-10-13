@@ -10,7 +10,10 @@ const SPEED: u32 = 64 | 256 | 512;
 
 const HELP: &[(&str, &str)] = &[
     ("!mp settings", "顯示房間設定"),
-    ("!mp start [秒數|force]", "開始遊戲（可倒數；force 無視未準備）"),
+    (
+        "!mp start [秒數|force]",
+        "開始遊戲（可倒數；force 無視未準備）",
+    ),
     ("!mp abort", "中止進行中的遊戲"),
     ("!mp map <圖譜ID>", "更換圖譜"),
     ("!mp mods <HD DT ...>", "設定 mods（none 為清除）"),
@@ -36,7 +39,7 @@ fn parse_mods(words: &[&str]) -> Option<u32> {
     if joined.is_empty() || joined == "NONE" || joined == "NM" {
         return Some(0);
     }
-    if joined.len() % 2 != 0 {
+    if !joined.len().is_multiple_of(2) {
         return None;
     }
     let mut bits = 0;
@@ -82,7 +85,10 @@ async fn say(db: &mut PgConnection, room_id: i16, lines: &[String]) -> Result<()
     Ok(())
 }
 
-async fn names(db: &mut PgConnection, m: &room::Match) -> Result<Vec<(usize, i64, String)>, ApiError> {
+async fn names(
+    db: &mut PgConnection,
+    m: &room::Match,
+) -> Result<Vec<(usize, i64, String)>, ApiError> {
     let ids: Vec<i64> = m.users.iter().flatten().map(|id| i64::from(*id)).collect();
     let rows = sqlx::query("SELECT id,username FROM users WHERE id=ANY($1)")
         .bind(ids)
@@ -90,10 +96,12 @@ async fn names(db: &mut PgConnection, m: &room::Match) -> Result<Vec<(usize, i64
         .await?;
     let mut found = Vec::new();
     for (slot, user) in m.users.iter().enumerate() {
-        if let Some(id) = user {
-            if let Some(row) = rows.iter().find(|r| r.get::<i64, _>("id") == i64::from(*id)) {
-                found.push((slot, i64::from(*id), row.get::<String, _>("username")));
-            }
+        if let Some(id) = user
+            && let Some(row) = rows
+                .iter()
+                .find(|r| r.get::<i64, _>("id") == i64::from(*id))
+        {
+            found.push((slot, i64::from(*id), row.get::<String, _>("username")));
         }
     }
     Ok(found)
@@ -126,15 +134,22 @@ pub(super) async fn run(
     let Some(sub) = parts.get(1).map(|s| s.to_ascii_lowercase()) else {
         return say(db, room_id, &["輸入 !mp help 查看多人房間指令。".into()]).await;
     };
-    let referee: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM stable_room_referees WHERE room_id=$1 AND user_id=$2)")
-        .bind(room_id)
-        .bind(user.id)
-        .fetch_one(&mut *db)
-        .await?;
+    let referee: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM stable_room_referees WHERE room_id=$1 AND user_id=$2)",
+    )
+    .bind(room_id)
+    .bind(user.id)
+    .fetch_one(&mut *db)
+    .await?;
     let allowed = m.host_id == id32(user.id)? || referee || user.can("users.moderate");
     let open_to_all = matches!(sub.as_str(), "help" | "h" | "settings" | "set" | "listref");
     if !allowed && !open_to_all {
-        return say(db, room_id, &["只有房主、裁判或管理員能使用這個指令。".into()]).await;
+        return say(
+            db,
+            room_id,
+            &["只有房主、裁判或管理員能使用這個指令。".into()],
+        )
+        .await;
     }
     let players = names(db, &m).await?;
     let mut lines: Vec<String> = Vec::new();
@@ -142,7 +157,10 @@ pub(super) async fn run(
     match sub.as_str() {
         "help" | "h" => {
             lines.push("多人房間指令：".into());
-            lines.extend(HELP.iter().map(|(usage, about)| format!("{usage} — {about}")));
+            lines.extend(
+                HELP.iter()
+                    .map(|(usage, about)| format!("{usage} — {about}")),
+            );
         }
         "settings" | "set" => {
             let win = ["分數", "準確率", "連擊", "ScoreV2"];
@@ -151,8 +169,16 @@ pub(super) async fn run(
                 "房間 #{}「{}」| 圖譜：{} | mods：{}{} | 勝利條件：{} | 模式：{}",
                 m.id,
                 m.name,
-                if m.map_name.is_empty() { "未選擇" } else { &m.map_name },
-                if m.mods == 0 { "無".to_string() } else { format!("{:#x}", m.mods) },
+                if m.map_name.is_empty() {
+                    "未選擇"
+                } else {
+                    &m.map_name
+                },
+                if m.mods == 0 {
+                    "無".to_string()
+                } else {
+                    format!("{:#x}", m.mods)
+                },
                 if m.freemods { "（自由 mods）" } else { "" },
                 win.get(m.win_condition as usize).unwrap_or(&"?"),
                 team.get(m.team_type as usize).unwrap_or(&"?"),
@@ -162,7 +188,11 @@ pub(super) async fn run(
                     "位置 {}：{}{}",
                     slot + 1,
                     name,
-                    if m.users[*slot] == Some(m.host_id) { "（房主）" } else { "" }
+                    if m.users[*slot] == Some(m.host_id) {
+                        "（房主）"
+                    } else {
+                        ""
+                    }
                 ));
             }
         }
@@ -180,7 +210,9 @@ pub(super) async fn run(
                     .await?;
                 lines.push(format!("遊戲將在 {seconds} 秒後開始。"));
             } else {
-                let force = parts.get(2).is_some_and(|s| s.eq_ignore_ascii_case("force"));
+                let force = parts
+                    .get(2)
+                    .is_some_and(|s| s.eq_ignore_ascii_case("force"));
                 if let Err(reason) = start_match(db, &mut m, force).await? {
                     lines.push(reason);
                 } else {
@@ -216,7 +248,10 @@ pub(super) async fn run(
                     .fetch_optional(&mut *db)
                     .await?;
                 match row {
-                    Some(row) if row.get::<Option<String>, _>("md5").is_some() && row.get::<Option<i64>, _>("native_id").is_some() => {
+                    Some(row)
+                        if row.get::<Option<String>, _>("md5").is_some()
+                            && row.get::<Option<i64>, _>("native_id").is_some() =>
+                    {
                         m.map_id = row.get::<i64, _>("native_id") as i32;
                         m.map_md5 = row.get::<String, _>("md5");
                         m.map_name = format!(
@@ -237,7 +272,8 @@ pub(super) async fn run(
                         changed = true;
                         lines.push(format!("已選擇圖譜：{}", m.map_name));
                     }
-                    _ => lines.push("伺服器上找不到這張圖譜，或它還不能在 stable 多人房間使用。".into()),
+                    _ => lines
+                        .push("伺服器上找不到這張圖譜，或它還不能在 stable 多人房間使用。".into()),
                 }
             }
         },
@@ -276,7 +312,10 @@ pub(super) async fn run(
                 }
                 m.freemods = target;
                 changed = true;
-                lines.push(format!("自由 mods 已{}。", if target { "開啟" } else { "關閉" }));
+                lines.push(format!(
+                    "自由 mods 已{}。",
+                    if target { "開啟" } else { "關閉" }
+                ));
             }
         }
         "host" => match parts.get(2).and_then(|n| slot_of(&players, n)) {
@@ -304,7 +343,11 @@ pub(super) async fn run(
             parts.get(2).and_then(|n| slot_of(&players, n)),
             parts.get(3).and_then(|s| s.parse::<usize>().ok()),
         ) {
-            (Some((from, _)), Some(to)) if (1..=room::SLOTS).contains(&to) && m.statuses[to - 1] == room::OPEN && !m.in_progress => {
+            (Some((from, _)), Some(to))
+                if (1..=room::SLOTS).contains(&to)
+                    && m.statuses[to - 1] == room::OPEN
+                    && !m.in_progress =>
+            {
                 let to = to - 1;
                 m.statuses.swap(from, to);
                 m.users.swap(from, to);
@@ -326,7 +369,9 @@ pub(super) async fn run(
             parts.get(2).and_then(|n| slot_of(&players, n)),
             parts.get(3).map(|s| s.to_ascii_lowercase()),
         ) {
-            (Some((target, _)), Some(color)) if m.team_type >= 2 && matches!(color.as_str(), "red" | "blue") => {
+            (Some((target, _)), Some(color))
+                if m.team_type >= 2 && matches!(color.as_str(), "red" | "blue") =>
+            {
                 m.teams[target] = if color == "red" { 2 } else { 1 };
                 changed = true;
                 lines.push("已更換隊伍。".into());
@@ -337,19 +382,34 @@ pub(super) async fn run(
             if m.in_progress {
                 lines.push("遊戲進行中無法更改。".into());
             } else {
-                let (from, to) = if sub == "lock" { (room::OPEN, room::LOCKED) } else { (room::LOCKED, room::OPEN) };
+                let (from, to) = if sub == "lock" {
+                    (room::OPEN, room::LOCKED)
+                } else {
+                    (room::LOCKED, room::OPEN)
+                };
                 for i in 0..room::SLOTS {
                     if m.users[i].is_none() && m.statuses[i] == from {
                         m.statuses[i] = to;
                     }
                 }
                 changed = true;
-                lines.push(if sub == "lock" { "已鎖定所有空位。" } else { "已開放所有空位。" }.into());
+                lines.push(
+                    if sub == "lock" {
+                        "已鎖定所有空位。"
+                    } else {
+                        "已開放所有空位。"
+                    }
+                    .into(),
+                );
             }
         }
         "size" => match parts.get(2).and_then(|s| s.parse::<usize>().ok()) {
             Some(size) if (1..=room::SLOTS).contains(&size) && !m.in_progress => {
-                let occupied = m.users.iter().rposition(Option::is_some).map_or(0, |i| i + 1);
+                let occupied = m
+                    .users
+                    .iter()
+                    .rposition(Option::is_some)
+                    .map_or(0, |i| i + 1);
                 if size < occupied {
                     lines.push(format!("房間最後一位玩家在位置 {occupied}，請先移動玩家。"));
                 } else {
@@ -371,7 +431,11 @@ pub(super) async fn run(
                 rest_text(&parts, 2)
             };
             let hash = password_hash(password.clone()).await?;
-            m.password = if hash.is_some() { "#".into() } else { String::new() };
+            m.password = if hash.is_some() {
+                "#".into()
+            } else {
+                String::new()
+            };
             sqlx::query("UPDATE stable_rooms SET password_hash=$2 WHERE id=$1")
                 .bind(room_id)
                 .bind(hash)
@@ -464,7 +528,11 @@ pub(super) async fn run(
                     .bind(room_id)
                     .fetch_all(&mut *db)
                     .await?;
-                lines.push(if refs.is_empty() { "目前沒有裁判。".to_string() } else { format!("裁判：{}", refs.join("、")) });
+                lines.push(if refs.is_empty() {
+                    "目前沒有裁判。".to_string()
+                } else {
+                    format!("裁判：{}", refs.join("、"))
+                });
             } else {
                 let target: Option<(i64, String)> = match parts.get(2) {
                     Some(name) => sqlx::query("SELECT id,username FROM users WHERE lower(username)=lower($1) AND NOT is_restricted AND NOT is_bot")
@@ -485,11 +553,13 @@ pub(super) async fn run(
                         lines.push(format!("{name} 現在是裁判。"));
                     }
                     Some((id, name)) => {
-                        sqlx::query("DELETE FROM stable_room_referees WHERE room_id=$1 AND user_id=$2")
-                            .bind(room_id)
-                            .bind(id)
-                            .execute(&mut *db)
-                            .await?;
+                        sqlx::query(
+                            "DELETE FROM stable_room_referees WHERE room_id=$1 AND user_id=$2",
+                        )
+                        .bind(room_id)
+                        .bind(id)
+                        .execute(&mut *db)
+                        .await?;
                         lines.push(format!("{name} 不再是裁判。"));
                     }
                 }
@@ -512,7 +582,14 @@ pub(super) async fn run(
                 .execute(&mut *db)
                 .await?
                 .rows_affected();
-            lines.push(if removed > 0 { "已取消倒數。" } else { "目前沒有倒數。" }.into());
+            lines.push(
+                if removed > 0 {
+                    "已取消倒數。"
+                } else {
+                    "目前沒有倒數。"
+                }
+                .into(),
+            );
         }
         "close" => {
             say(db, room_id, &["房間即將解散。".into()]).await?;
@@ -549,7 +626,9 @@ pub(super) async fn start_match(
         return Ok(Err("請先選擇圖譜。".into()));
     }
     if !force && m.statuses.contains(&room::NOT_READY) {
-        return Ok(Err("還有玩家沒有準備好。（用 !mp start force 強制開始）".into()));
+        return Ok(Err(
+            "還有玩家沒有準備好。（用 !mp start force 強制開始）".into()
+        ));
     }
     let mut participants = 0;
     for status in &mut m.statuses {
@@ -562,30 +641,44 @@ pub(super) async fn start_match(
         return Ok(Err("沒有可以開始的玩家。".into()));
     }
     m.in_progress = true;
-    sqlx::query("UPDATE stable_room_members SET loaded=false,skipped=false,failed=false WHERE room_id=$1")
-        .bind(m.id as i16)
-        .execute(&mut *db)
-        .await?;
-    send_room(db, m.id as i16, &wire::encode_packet(START, &m.encode(true)?)?, None).await?;
+    sqlx::query(
+        "UPDATE stable_room_members SET loaded=false,skipped=false,failed=false WHERE room_id=$1",
+    )
+    .bind(m.id as i16)
+    .execute(&mut *db)
+    .await?;
+    send_room(
+        db,
+        m.id as i16,
+        &wire::encode_packet(START, &m.encode(true)?)?,
+        None,
+    )
+    .await?;
     Ok(Ok(()))
 }
 
 /// Fire due room timers. A "start" timer starts the match; a "notice" timer only announces.
 pub(crate) async fn run_timers(state: &AppState) -> Result<(), ApiError> {
     let mut tx = state.pool.begin().await?;
-    let due = sqlx::query("DELETE FROM stable_room_timers WHERE due_at<=now() RETURNING room_id,kind")
-        .fetch_all(&mut *tx)
-        .await?;
+    let due =
+        sqlx::query("DELETE FROM stable_room_timers WHERE due_at<=now() RETURNING room_id,kind")
+            .fetch_all(&mut *tx)
+            .await?;
     for row in due {
         let room_id: i16 = row.get("room_id");
         let kind: String = row.get("kind");
-        sqlx::query("SELECT pg_advisory_xact_lock(512918376)").execute(&mut *tx).await?;
-        let state_json: Option<serde_json::Value> = sqlx::query_scalar("SELECT state FROM stable_rooms WHERE id=$1 FOR UPDATE")
-            .bind(room_id)
-            .fetch_optional(&mut *tx)
+        sqlx::query("SELECT pg_advisory_xact_lock(512918376)")
+            .execute(&mut *tx)
             .await?;
+        let state_json: Option<serde_json::Value> =
+            sqlx::query_scalar("SELECT state FROM stable_rooms WHERE id=$1 FOR UPDATE")
+                .bind(room_id)
+                .fetch_optional(&mut *tx)
+                .await?;
         let Some(value) = state_json else { continue };
-        let Ok(mut m) = serde_json::from_value::<room::Match>(value) else { continue };
+        let Ok(mut m) = serde_json::from_value::<room::Match>(value) else {
+            continue;
+        };
         if kind == "start" {
             match start_match(&mut tx, &mut m, true).await? {
                 Ok(()) => {
